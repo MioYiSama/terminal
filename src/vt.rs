@@ -30,6 +30,21 @@ impl From<GhosttyColorRgb> for Rgb {
     }
 }
 
+impl From<Rgb> for GhosttyColorRgb {
+    fn from(c: Rgb) -> Self {
+        Self { r: c.r, g: c.g, b: c.b }
+    }
+}
+
+/// Default colors: what the terminal shows until a program overrides them
+/// (OSC 4/10/11/12) and returns to after a reset.
+pub struct TerminalColors {
+    pub foreground: Rgb,
+    pub background: Rgb,
+    pub cursor: Rgb,
+    pub palette: [Rgb; 256],
+}
+
 /// Side effects the VT stream produced during the last write. Shared with
 /// the C callbacks through the terminal's userdata pointer.
 #[derive(Default)]
@@ -146,6 +161,22 @@ impl Terminal {
         }
         let bytes = unsafe { slice::from_raw_parts(title.ptr, title.len) };
         Some(String::from_utf8_lossy(bytes).into_owned())
+    }
+
+    pub fn set_colors(&mut self, colors: &TerminalColors) {
+        let foreground = GhosttyColorRgb::from(colors.foreground);
+        let background = GhosttyColorRgb::from(colors.background);
+        let cursor = GhosttyColorRgb::from(colors.cursor);
+        let palette = colors.palette.map(GhosttyColorRgb::from);
+        let options = [
+            (GHOSTTY_TERMINAL_OPT_COLOR_FOREGROUND, &foreground as *const _ as *const c_void),
+            (GHOSTTY_TERMINAL_OPT_COLOR_BACKGROUND, &background as *const _ as *const c_void),
+            (GHOSTTY_TERMINAL_OPT_COLOR_CURSOR, &cursor as *const _ as *const c_void),
+            (GHOSTTY_TERMINAL_OPT_COLOR_PALETTE, palette.as_ptr() as *const c_void),
+        ];
+        for (option, value) in options {
+            unsafe { ghostty_terminal_set(self.raw, option, value) };
+        }
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16, cell_width: u32, cell_height: u32) {

@@ -16,6 +16,8 @@ use gpui::{
 use crate::element::TerminalElement;
 use crate::keys;
 use crate::pty::{Pty, PtyEvent};
+use crate::settings::{MAX_FONT_SIZE, MIN_FONT_SIZE, Settings};
+use crate::theme;
 use crate::vt::{
     self, Frame, GesturePoint, KeyEncoder, KeyInput, MouseEncoder, RenderState, SelectionGesture,
     SurfaceSize, Terminal,
@@ -35,7 +37,6 @@ actions!(
 
 pub const KEY_CONTEXT: &str = "Terminal";
 pub const PADDING: Pixels = px(6.);
-const DEFAULT_FONT_SIZE: Pixels = px(14.);
 const MODE_FOCUS_EVENT: u16 = 1004;
 const MODE_ALTERNATE_SCROLL: u16 = 1007;
 
@@ -94,6 +95,8 @@ pub struct TerminalView {
     focus_handle: FocusHandle,
     font_family: String,
     font_size: Pixels,
+    /// Font size from the settings; zooming changes `font_size` only.
+    base_font_size: Pixels,
     layout: Option<GridLayout>,
     /// IME composition text, shown at the cursor until committed.
     marked_text: String,
@@ -108,9 +111,13 @@ pub struct TerminalView {
 }
 
 impl TerminalView {
-    pub fn new(font_family: String, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let (cols, rows) = (80, 24);
         let mut terminal = Terminal::new(cols, rows);
+        let settings = Settings::get(cx);
+        let font_family = settings.font_family.clone();
+        let font_size = settings.font_size();
+        terminal.set_colors(&theme::terminal_colors(settings.flavor(window.appearance())));
         let gesture = SelectionGesture::new(&terminal);
 
         let (pty, events) = match Pty::spawn(cols, rows, 8, 16) {
@@ -156,6 +163,8 @@ impl TerminalView {
         let subscriptions = vec![
             cx.on_focus(&focus_handle, window, |view, _, cx| view.focus_changed(true, cx)),
             cx.on_blur(&focus_handle, window, |view, _, cx| view.focus_changed(false, cx)),
+            cx.observe_global_in::<Settings>(window, Self::apply_settings),
+            cx.observe_window_appearance(window, Self::apply_theme),
         ];
         focus_handle.focus(window);
 
@@ -169,7 +178,8 @@ impl TerminalView {
             pty,
             focus_handle,
             font_family,
-            font_size: DEFAULT_FONT_SIZE,
+            font_size,
+            base_font_size: font_size,
             layout: None,
             marked_text: String::new(),
             scroll_remainder: 0.,
@@ -222,6 +232,24 @@ impl TerminalView {
     pub fn snapshot(&mut self) -> &Frame {
         self.render_state.snapshot(&self.terminal, &mut self.frame);
         &self.frame
+    }
+
+    fn apply_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let settings = Settings::get(cx);
+        if self.font_family != settings.font_family {
+            self.font_family = settings.font_family.clone();
+        }
+        if self.base_font_size != settings.font_size() {
+            self.base_font_size = settings.font_size();
+            self.font_size = self.base_font_size;
+        }
+        self.apply_theme(window, cx);
+    }
+
+    fn apply_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let flavor = Settings::get(cx).flavor(window.appearance());
+        self.terminal.set_colors(&theme::terminal_colors(flavor));
+        cx.notify();
     }
 
     fn process_output(&mut self, bytes: &[u8], window: &mut Window, cx: &mut Context<Self>) {
@@ -355,7 +383,7 @@ impl TerminalView {
     }
 
     fn change_font_size(&mut self, size: Pixels, cx: &mut Context<Self>) {
-        self.font_size = size.clamp(px(6.), px(72.));
+        self.font_size = size.clamp(px(MIN_FONT_SIZE), px(MAX_FONT_SIZE));
         cx.notify();
     }
 
@@ -692,7 +720,7 @@ impl Render for TerminalView {
                 view.change_font_size(view.font_size - px(1.), cx)
             }))
             .on_action(cx.listener(|view, _: &ResetFontSize, _, cx| {
-                view.change_font_size(DEFAULT_FONT_SIZE, cx)
+                view.change_font_size(view.base_font_size, cx)
             }))
             .on_key_down(cx.listener(Self::key_down))
             .on_key_up(cx.listener(Self::key_up))
