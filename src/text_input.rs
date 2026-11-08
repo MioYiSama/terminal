@@ -4,7 +4,7 @@
 use std::ops::Range;
 
 use gpui::{
-    App, Bounds, ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler,
+    App, Bounds, ClipboardItem, ContentMask, Context, CursorStyle, Element, ElementId, ElementInputHandler,
     Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, Hsla,
     KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
     Pixels, Point, ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle,
@@ -39,6 +39,7 @@ actions!(
 );
 
 const KEY_CONTEXT: &str = "TextInput";
+const CURSOR_WIDTH: Pixels = px(1.5);
 
 pub fn bind_keys(cx: &mut App) {
     let ctx = Some(KEY_CONTEXT);
@@ -89,6 +90,9 @@ pub struct TextInput {
     marked_range: Option<Range<usize>>,
     last_layout: Option<ShapedLine>,
     last_bounds: Option<Bounds<Pixels>>,
+    /// How far the text is scrolled left to keep the cursor in view, as of
+    /// the last frame.
+    scroll_x: Pixels,
     is_selecting: bool,
 }
 
@@ -105,6 +109,7 @@ impl TextInput {
             marked_range: None,
             last_layout: None,
             last_bounds: None,
+            scroll_x: px(0.),
             is_selecting: false,
         }
     }
@@ -266,7 +271,13 @@ impl TextInput {
         if position.y > bounds.bottom() {
             return self.content.len();
         }
-        line.closest_index_for_x(position.x - bounds.left())
+        line.closest_index_for_x(position.x - self.text_left(bounds))
+    }
+
+    /// Where the text starts horizontally: scrolled text starts left of
+    /// `bounds`.
+    fn text_left(&self, bounds: &Bounds<Pixels>) -> Pixels {
+        bounds.left() - self.scroll_x
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
@@ -415,9 +426,10 @@ impl EntityInputHandler for TextInput {
     ) -> Option<Bounds<Pixels>> {
         let last_layout = self.last_layout.as_ref()?;
         let range = self.range_from_utf16(&range_utf16);
+        let left = self.text_left(&bounds);
         Some(Bounds::from_corners(
-            point(bounds.left() + last_layout.x_for_index(range.start), bounds.top()),
-            point(bounds.left() + last_layout.x_for_index(range.end), bounds.bottom()),
+            point(left + last_layout.x_for_index(range.start), bounds.top()),
+            point(left + last_layout.x_for_index(range.end), bounds.bottom()),
         ))
     }
 
@@ -429,7 +441,7 @@ impl EntityInputHandler for TextInput {
     ) -> Option<usize> {
         let bounds = self.last_bounds?;
         let last_layout = self.last_layout.as_ref()?;
-        let utf8_index = last_layout.index_for_x(point.x - bounds.left())?;
+        let utf8_index = last_layout.index_for_x(point.x - self.text_left(&bounds))?;
         Some(utf16::from_byte(&self.content, utf8_index))
     }
 }
@@ -484,6 +496,21 @@ impl Render for TextInput {
     }
 }
 
+/// The horizontal scroll that keeps the cursor at `cursor_x` visible in a
+/// field `width` wide, moving as little as possible from `scroll_x`, and
+/// never leaving empty space after text `text_width` wide.
+fn scroll_to_show(scroll_x: Pixels, cursor_x: Pixels, text_width: Pixels, width: Pixels) -> Pixels {
+    let max_scroll = (text_width + CURSOR_WIDTH - width).max(px(0.));
+    let scroll_x = scroll_x.min(max_scroll);
+    if cursor_x < scroll_x {
+        cursor_x
+    } else if cursor_x + CURSOR_WIDTH > scroll_x + width {
+        cursor_x + CURSOR_WIDTH - width
+    } else {
+        scroll_x
+    }
+}
+
 struct TextElement {
     input: Entity<TextInput>,
     colors: UiColors,
@@ -491,6 +518,7 @@ struct TextElement {
 
 struct PrepaintState {
     line: Option<ShapedLine>,
+    scroll_x: Pixels,
     cursor: Option<PaintQuad>,
     selection: Option<PaintQuad>,
 }
@@ -584,17 +612,20 @@ impl Element for TextElement {
             .text_system()
             .shape_line(display_text, font_size, &runs, None);
 
+        let cursor_x = if input.content.is_empty() {
+            px(0.)
+        } else {
+            line.x_for_index(input.cursor_offset())
+        };
+        let scroll_x = scroll_to_show(input.scroll_x, cursor_x, line.width, bounds.size.width);
+        let left = bounds.left() - scroll_x;
+
         let selected_range = &input.selected_range;
         let (selection, cursor) = if selected_range.is_empty() {
-            let x = if input.content.is_empty() {
-                px(0.)
-            } else {
-                line.x_for_index(input.cursor_offset())
-            };
             let cursor = fill(
                 Bounds::new(
-                    point(bounds.left() + x, bounds.top()),
-                    size(px(1.5), bounds.size.height),
+                    point(left + cursor_x, bounds.top()),
+                    size(CURSOR_WIDTH, bounds.size.height),
                 ),
                 self.colors.accent,
             );
@@ -602,8 +633,8 @@ impl Element for TextElement {
         } else {
             let selection = fill(
                 Bounds::from_corners(
-                    point(bounds.left() + line.x_for_index(selected_range.start), bounds.top()),
-                    point(bounds.left() + line.x_for_index(selected_range.end), bounds.bottom()),
+                    point(left + line.x_for_index(selected_range.start), bounds.top()),
+                    point(left + line.x_for_index(selected_range.end), bounds.bottom()),
                 ),
                 self.colors.accent.opacity(0.3),
             );
@@ -611,6 +642,7 @@ impl Element for TextElement {
         };
         PrepaintState {
             line: Some(line),
+            scroll_x,
             cursor,
             selection,
         }
@@ -632,22 +664,50 @@ impl Element for TextElement {
             ElementInputHandler::new(bounds, self.input.clone()),
             cx,
         );
-        if let Some(selection) = prepaint.selection.take() {
-            window.paint_quad(selection)
-        }
         let Some(line) = prepaint.line.take() else {
             return;
         };
-        let _ = line.paint(bounds.origin, window.line_height(), window, cx);
-        if focus_handle.is_focused(window)
-            && let Some(cursor) = prepaint.cursor.take()
-        {
-            window.paint_quad(cursor);
-        }
+        let scroll_x = prepaint.scroll_x;
+        // Scrolled-out text stays inside the field.
+        window.with_content_mask(Some(ContentMask { bounds }), |window| {
+            if let Some(selection) = prepaint.selection.take() {
+                window.paint_quad(selection)
+            }
+            let origin = point(bounds.left() - scroll_x, bounds.top());
+            let _ = line.paint(origin, window.line_height(), window, cx);
+            if focus_handle.is_focused(window)
+                && let Some(cursor) = prepaint.cursor.take()
+            {
+                window.paint_quad(cursor);
+            }
+        });
         self.input.update(cx, |input, _cx| {
             // Mouse hit-testing uses the real text, not the placeholder.
             input.last_layout = (!input.content.is_empty()).then_some(line);
             input.last_bounds = Some(bounds);
+            input.scroll_x = scroll_x;
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::px;
+
+    use super::{CURSOR_WIDTH, scroll_to_show};
+
+    #[test]
+    fn scrolls_only_to_keep_the_cursor_visible() {
+        let (text, width) = (px(300.), px(100.));
+        // Short text never scrolls.
+        assert_eq!(scroll_to_show(px(0.), px(50.), px(80.), width), px(0.));
+        // Moving right past the edge scrolls just far enough.
+        assert_eq!(scroll_to_show(px(0.), px(150.), text, width), px(150.) + CURSOR_WIDTH - width);
+        // Moving within the visible part keeps the scroll.
+        assert_eq!(scroll_to_show(px(60.), px(100.), text, width), px(60.));
+        // Moving left past the edge scrolls back to the cursor.
+        assert_eq!(scroll_to_show(px(60.), px(20.), text, width), px(20.));
+        // Deleting text pulls the scroll back so no space is left after it.
+        assert_eq!(scroll_to_show(px(200.), px(40.), px(120.), width), px(20.) + CURSOR_WIDTH);
     }
 }
