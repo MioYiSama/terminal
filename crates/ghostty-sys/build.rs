@@ -127,6 +127,10 @@ fn link_lib(prefix: &Path) {
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         println!("cargo:rustc-link-lib=static=ghostty-vt-static");
+        // The Zig standard library inside the archive calls NT and kernel32
+        // APIs; the static library's pkg-config file doesn't list them.
+        println!("cargo:rustc-link-lib=ntdll");
+        println!("cargo:rustc-link-lib=kernel32");
     } else {
         println!("cargo:rustc-link-lib=static=ghostty-vt");
     }
