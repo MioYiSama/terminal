@@ -54,24 +54,37 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Build
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: cargo build --release --locked --timings --target ${{ matrix.target }}
+
+      - name: Upload build timings
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: cargo-timings-${{ matrix.target }}
+          path: target/cargo-timings/cargo-timing.html
 
       - name: Package
+        id: package
         shell: bash
         run: |
           name="terminal-${GITHUB_REF_NAME//\//-}-${{ matrix.target }}"
           dir="target/${{ matrix.target }}/release"
           mkdir -p dist
           if [[ "${{ runner.os }}" == "Windows" ]]; then
-            7z a "dist/$name.zip" "./$dir/terminal.exe"
+            file="dist/$name.zip"
+            7z a "$file" "./$dir/terminal.exe"
           else
-            tar -C "$dir" -czf "dist/$name.tar.gz" terminal
+            file="dist/$name.tar.gz"
+            tar -C "$dir" -czf "$file" terminal
           fi
+          echo "file=$file" >> "$GITHUB_OUTPUT"
 
+      # Upload the archive as-is (named after the file) instead of zipping it
+      # again.
       - uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.target }}
-          path: dist/*
+          path: ${{ steps.package.outputs.file }}
+          archive: false
           if-no-files-found: error
 
   release:
@@ -85,7 +98,10 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           path: dist
+          pattern: terminal-*
           merge-multiple: true
+          # Keep the Windows .zip intact instead of extracting it.
+          skip-decompress: true
 
       - name: Checksums
         working-directory: dist

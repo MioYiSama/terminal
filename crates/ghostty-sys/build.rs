@@ -11,6 +11,9 @@
 //!   `ReleaseSmall` for `opt-level=s|z`, and `ReleaseFast` otherwise.
 //! - `GHOSTTY_SYS_ZIG_TARGET`: Zig target triple. Defaults to the host when
 //!   not cross-compiling, otherwise to a triple derived from the Cargo target.
+//! - `ZIG_LOCAL_CACHE_DIR`: Zig's local cache directory (default:
+//!   `$OUT_DIR/zig-cache`). Point it at a persistent directory to reuse Zig
+//!   build results when Cargo reruns this script.
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -57,9 +60,12 @@ fn build_lib(source: &Path, out_dir: &Path, prefix: &Path) {
         .arg(format!("-Doptimize={}", optimize_mode()))
         .arg("-Dcpu=baseline")
         .arg("--prefix")
-        .arg(prefix)
-        .arg("--cache-dir")
-        .arg(out_dir.join("zig-cache"));
+        .arg(prefix);
+    // `--cache-dir` would override `ZIG_LOCAL_CACHE_DIR`, which CI (setup-zig)
+    // points at a cache persisted across runs.
+    if env::var_os("ZIG_LOCAL_CACHE_DIR").is_none() {
+        cmd.arg("--cache-dir").arg(out_dir.join("zig-cache"));
+    }
     if let Some(target) = zig_target() {
         cmd.arg(format!("-Dtarget={target}"));
     }
