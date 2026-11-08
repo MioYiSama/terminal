@@ -33,6 +33,7 @@ actions!(
         Paste,
         Cut,
         Copy,
+        Blur,
     ]
 );
 
@@ -51,6 +52,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("end", End, ctx),
         KeyBinding::new("shift-home", SelectToHome, ctx),
         KeyBinding::new("shift-end", SelectToEnd, ctx),
+        KeyBinding::new("escape", Blur, ctx),
     ]);
     if cfg!(target_os = "macos") {
         cx.bind_keys([
@@ -108,6 +110,13 @@ impl TextInput {
 
     pub fn text(&self) -> &str {
         &self.content
+    }
+
+    pub fn set_placeholder(&mut self, placeholder: SharedString, cx: &mut Context<Self>) {
+        if self.placeholder != placeholder {
+            self.placeholder = placeholder;
+            cx.notify();
+        }
     }
 
     fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
@@ -169,7 +178,13 @@ impl TextInput {
         self.replace_text_in_range(None, "", window, cx)
     }
 
+    fn blur(&mut self, _: &Blur, window: &mut Window, _: &mut Context<Self>) {
+        window.blur();
+    }
+
     fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // Keep containers that blur on click from seeing this one.
+        cx.stop_propagation();
         self.focus_handle.focus(window);
         self.is_selecting = true;
         let offset = self.index_for_mouse_position(event.position);
@@ -483,6 +498,7 @@ impl Render for TextInput {
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::cut))
             .on_action(cx.listener(Self::copy))
+            .on_action(cx.listener(Self::blur))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::mouse_up))

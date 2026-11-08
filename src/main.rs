@@ -3,6 +3,7 @@
 
 mod about;
 mod element;
+mod i18n;
 mod keys;
 mod pty;
 mod settings;
@@ -18,6 +19,7 @@ use gpui::{
 };
 
 use about::AboutView;
+use i18n::tr;
 use settings::Settings;
 use settings_view::SettingsView;
 
@@ -81,10 +83,11 @@ fn open_terminal_window(cx: &mut App) {
     }
 }
 
-/// Focus the open window showing a `V`, or open one.
+/// Focus the open window showing a `V`, or open one titled with message
+/// `title_id`.
 fn open_or_activate<V: Render>(
     cx: &mut App,
-    title: &'static str,
+    title_id: &str,
     window_size: Size<Pixels>,
     new: fn(&mut Window, &mut gpui::Context<V>) -> V,
 ) {
@@ -93,11 +96,12 @@ fn open_or_activate<V: Render>(
         return;
     }
     let bounds = Bounds::centered(None, window_size, cx);
+    let title = tr(cx, title_id);
     let result = cx.open_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             titlebar: Some(TitlebarOptions {
-                title: Some(title.into()),
+                title: Some(title.clone()),
                 ..Default::default()
             }),
             is_minimizable: false,
@@ -108,6 +112,21 @@ fn open_or_activate<V: Render>(
     if let Err(err) = result {
         eprintln!("failed to open {title} window: {err}");
     }
+}
+
+fn set_menus(cx: &mut App) {
+    cx.set_menus(vec![Menu {
+        name: "Terminal".into(),
+        items: vec![
+            MenuItem::action(tr(cx, "menu-about"), About),
+            MenuItem::separator(),
+            MenuItem::action(tr(cx, "menu-settings"), OpenSettings),
+            MenuItem::separator(),
+            MenuItem::action(tr(cx, "menu-new-window"), NewWindow),
+            MenuItem::separator(),
+            MenuItem::action(tr(cx, "menu-quit"), Quit),
+        ],
+    }]);
 }
 
 fn main() {
@@ -123,25 +142,23 @@ fn main() {
         Settings::init(cx);
         bind_keys(cx);
         cx.on_action(|_: &About, cx| {
-            open_or_activate(cx, "About Terminal", size(px(420.), px(260.)), AboutView::new)
+            open_or_activate(cx, "about-title", size(px(420.), px(260.)), AboutView::new)
         });
         cx.on_action(|_: &OpenSettings, cx| {
-            open_or_activate(cx, "Settings", size(px(720.), px(680.)), SettingsView::new)
+            open_or_activate(cx, "settings-title", size(px(720.), px(760.)), SettingsView::new)
         });
         cx.on_action(|_: &NewWindow, cx| open_terminal_window(cx));
         cx.on_action(|_: &Quit, cx| cx.quit());
-        cx.set_menus(vec![Menu {
-            name: "Terminal".into(),
-            items: vec![
-                MenuItem::action("About Terminal", About),
-                MenuItem::separator(),
-                MenuItem::action("Settings…", OpenSettings),
-                MenuItem::separator(),
-                MenuItem::action("New Window", NewWindow),
-                MenuItem::separator(),
-                MenuItem::action("Quit", Quit),
-            ],
-        }]);
+        set_menus(cx);
+        let mut language = Settings::get(cx).language.resolve();
+        cx.observe_global::<Settings>(move |cx| {
+            let current = Settings::get(cx).language.resolve();
+            if current != language {
+                language = current;
+                set_menus(cx);
+            }
+        })
+        .detach();
 
         open_terminal_window(cx);
         cx.activate(true);

@@ -3,11 +3,12 @@
 
 use catppuccin::FlavorName;
 use gpui::{
-    App, Context, Div, ElementId, Entity, Focusable, FontWeight, KeyBinding, Point, ScrollStrategy,
+    App, Context, Div, ElementId, Entity, FontWeight, KeyBinding, MouseButton, Point, ScrollStrategy,
     SharedString, Stateful, Subscription, UniformListScrollHandle, Window, actions, div,
     prelude::*, px, uniform_list,
 };
 
+use crate::i18n::{Language, tr};
 use crate::settings::{MAX_FONT_SIZE, MIN_FONT_SIZE, Settings, ThemeMode};
 use crate::text_input::{Changed, TextInput};
 use crate::theme::{UiColors, hsla};
@@ -32,13 +33,15 @@ const FLAVORS: [FlavorName; 4] = [
     FlavorName::Mocha,
 ];
 
+/// Theme modes and their message ids.
 const THEME_MODES: [(ThemeMode, &str); 3] = [
-    (ThemeMode::System, "System"),
-    (ThemeMode::Light, "Light"),
-    (ThemeMode::Dark, "Dark"),
+    (ThemeMode::System, "settings-system"),
+    (ThemeMode::Light, "settings-light"),
+    (ThemeMode::Dark, "settings-dark"),
 ];
 
-const PREVIEW_TEXT: &str = "The quick brown fox jumps over the lazy dog\n0123456789 -> => != == {} [] () ~/.config $ ls -la";
+/// Preview line after the translated sample text.
+const PREVIEW_CODE: &str = "0123456789 -> => != == {} [] () ~/.config $ ls -la";
 
 pub struct SettingsView {
     font_query: Entity<TextInput>,
@@ -66,10 +69,15 @@ impl SettingsView {
         fonts.sort_unstable_by_key(|name| name.to_lowercase());
         fonts.dedup();
 
-        let font_query = cx.new(|cx| TextInput::new("Search fonts", cx));
-        font_query.read(cx).focus_handle(cx).focus(window);
+        let font_query = cx.new(|cx| TextInput::new(tr(cx, "settings-search-fonts"), cx));
         let subscriptions = vec![
-            cx.observe_global_in::<Settings>(window, |_, _, cx| cx.notify()),
+            cx.observe_global_in::<Settings>(window, |view: &mut Self, window, cx| {
+                window.set_window_title(&tr(cx, "settings-title"));
+                let placeholder = tr(cx, "settings-search-fonts");
+                view.font_query
+                    .update(cx, |input, cx| input.set_placeholder(placeholder, cx));
+                cx.notify();
+            }),
             cx.observe_window_appearance(window, |_, _, cx| cx.notify()),
             cx.subscribe(&font_query, |view, _, _: &Changed, cx| view.filter_fonts(cx)),
         ];
@@ -207,7 +215,7 @@ impl SettingsView {
                             .px_2()
                             .py(px(3.))
                             .text_color(colors.muted)
-                            .child("No matching fonts"),
+                            .child(tr(cx, "settings-no-matching-fonts")),
                     )
                 } else {
                     results.child(list)
@@ -227,7 +235,7 @@ impl SettingsView {
     }
 }
 
-fn section(title: &'static str, colors: UiColors) -> Div {
+fn section(title: SharedString, colors: UiColors) -> Div {
     div()
         .flex()
         .flex_col()
@@ -246,7 +254,7 @@ fn section(title: &'static str, colors: UiColors) -> Div {
         )
 }
 
-fn row(label: &'static str, control: impl IntoElement) -> Div {
+fn row(label: SharedString, control: impl IntoElement) -> Div {
     div()
         .flex()
         .items_start()
@@ -322,10 +330,21 @@ impl Render for SettingsView {
         let flavor = settings.flavor(window.appearance());
         let colors = UiColors::new(flavor);
 
+        let languages = div().flex().gap_2().children(Language::ALL.map(|language| {
+            let label = language
+                .native_name()
+                .map_or_else(|| tr(cx, "settings-system"), SharedString::from);
+            choice(("language", language as usize), settings.language == language, colors)
+                .on_click(move |_, _, cx| {
+                    Settings::update(cx, |settings| settings.language = language)
+                })
+                .child(label)
+        }));
+
         let theme_modes = div().flex().gap_2().children(THEME_MODES.map(|(mode, label)| {
             choice(("theme-mode", mode as usize), settings.theme_mode == mode, colors)
                 .on_click(move |_, _, cx| Settings::update(cx, |settings| settings.theme_mode = mode))
-                .child(label)
+                .child(tr(cx, label))
         }));
 
         let stepper = |id: &'static str, label: &'static str, delta: f32, enabled: bool| {
@@ -367,7 +386,12 @@ impl Render for SettingsView {
                     .text_color(hsla(flavor.colors.subtext0.rgb))
                     .child(format!("{} · {} pt", settings.font_family, settings.font_size)),
             )
-            .children(PREVIEW_TEXT.lines().map(|line| div().child(line)))
+            .children(
+                tr(cx, "settings-preview")
+                    .lines()
+                    .chain([PREVIEW_CODE])
+                    .map(|line| div().child(line.to_owned())),
+            )
             .child(
                 div().flex().flex_wrap().gap_1().children(
                     ansi.iter()
@@ -377,6 +401,8 @@ impl Render for SettingsView {
 
         div()
             .id("settings")
+            // Clicking anywhere outside a text field takes focus away from it.
+            .on_mouse_down(MouseButton::Left, |_, window, _| window.blur())
             .size_full()
             .overflow_y_scroll()
             .flex()
@@ -387,25 +413,32 @@ impl Render for SettingsView {
             .text_color(colors.text)
             .text_sm()
             .child(
-                section("Appearance", colors)
-                    .child(row("Theme", theme_modes))
+                section(tr(cx, "settings-general"), colors)
+                    .child(row(tr(cx, "settings-language"), languages)),
+            )
+            .child(
+                section(tr(cx, "settings-appearance"), colors)
+                    .child(row(tr(cx, "settings-theme"), theme_modes))
                     .child(row(
-                        "Light theme",
+                        tr(cx, "settings-light-theme"),
                         flavor_choices("light-theme", settings.light_theme, colors, |s, name| {
                             s.light_theme = name
                         }),
                     ))
                     .child(row(
-                        "Dark theme",
+                        tr(cx, "settings-dark-theme"),
                         flavor_choices("dark-theme", settings.dark_theme, colors, |s, name| {
                             s.dark_theme = name
                         }),
                     )),
             )
             .child(
-                section("Font", colors)
-                    .child(row("Size", font_size))
-                    .child(row("Family", self.render_font_picker(colors, cx).flex_1()))
+                section(tr(cx, "settings-font"), colors)
+                    .child(row(tr(cx, "settings-font-size"), font_size))
+                    .child(row(
+                        tr(cx, "settings-font-family"),
+                        self.render_font_picker(colors, cx).flex_1(),
+                    ))
                     .child(preview),
             )
     }

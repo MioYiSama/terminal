@@ -1,7 +1,9 @@
 //! The "About Terminal" window.
 
+use fluent_bundle::FluentArgs;
 use gpui::{Context, FontWeight, Subscription, Window, div, prelude::*, px};
 
+use crate::i18n::{tr, tr_args};
 use crate::settings::Settings;
 use crate::theme::UiColors;
 
@@ -15,7 +17,10 @@ impl AboutView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         Self {
             _subscriptions: vec![
-                cx.observe_global_in::<Settings>(window, |_, _, cx| cx.notify()),
+                cx.observe_global_in::<Settings>(window, |_, window, cx| {
+                    window.set_window_title(&tr(cx, "about-title"));
+                    cx.notify();
+                }),
                 cx.observe_window_appearance(window, |_, _, cx| cx.notify()),
             ],
         }
@@ -25,6 +30,8 @@ impl AboutView {
 impl Render for AboutView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = UiColors::new(Settings::get(cx).flavor(window.appearance()));
+        let mut version = FluentArgs::new();
+        version.set("version", env!("CARGO_PKG_VERSION"));
         div()
             .size_full()
             .flex()
@@ -45,14 +52,9 @@ impl Render for AboutView {
             .child(
                 div()
                     .text_color(colors.muted)
-                    .child(format!("Version {}", env!("CARGO_PKG_VERSION"))),
+                    .child(tr_args(cx, "about-version", &version)),
             )
-            .child(div().mt_2().child("A terminal emulator built on GPUI and libghostty-vt."))
-            .child(
-                div()
-                    .text_color(colors.muted)
-                    .child("Colors by Catppuccin."),
-            )
+            .child(div().mt_2().child(tr(cx, "about-description")))
             .child(
                 div()
                     .id("repository")

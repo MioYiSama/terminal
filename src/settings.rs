@@ -8,6 +8,8 @@ use catppuccin::{Flavor, FlavorName, Palette};
 use gpui::{App, Global, Pixels, WindowAppearance, px};
 use serde::{Deserialize, Serialize};
 
+use crate::i18n::Language;
+
 pub const MIN_FONT_SIZE: f32 = 6.;
 pub const MAX_FONT_SIZE: f32 = 72.;
 const DEFAULT_FONT_SIZE: f32 = 14.;
@@ -44,6 +46,7 @@ pub enum ThemeMode {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    pub language: Language,
     pub font_family: String,
     pub font_size: f32,
     pub theme_mode: ThemeMode,
@@ -56,6 +59,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            language: Language::System,
             font_family: String::new(),
             font_size: DEFAULT_FONT_SIZE,
             theme_mode: ThemeMode::System,
