@@ -2,8 +2,11 @@
 
 use core::ffi::c_void;
 use core::{ptr, slice};
+use std::io::Cursor;
 
 use ghostty_sys::*;
+use image::codecs::png::PngDecoder;
+use image::{ColorType, DynamicImage, GenericImageView, ImageDecoder};
 
 use super::Terminal;
 
@@ -29,24 +32,49 @@ unsafe extern "C" fn decode_png(
     out: *mut GhosttySysImage,
 ) -> bool {
     let bytes = unsafe { slice::from_raw_parts(data, len) };
-    let Ok(image) = image::load_from_memory_with_format(bytes, image::ImageFormat::Png) else {
+    let Ok(decoder) = PngDecoder::new(Cursor::new(bytes)) else {
         return false;
     };
-    let image = image.into_rgba8();
-    let pixels = image.as_raw();
-    // The allocator caps one image's memory: NULL means too large.
-    let buffer = unsafe { ghostty_alloc(allocator, pixels.len()) };
+    let (width, height) = decoder.dimensions();
+    let Some(data_len) = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|pixels| pixels.checked_mul(4))
+    else {
+        return false;
+    };
+    // Allocate the result before decoding: the allocator caps one image's
+    // memory (NULL means too large), so oversized images cost nothing.
+    let buffer = unsafe { ghostty_alloc(allocator, data_len) };
     if buffer.is_null() {
         return false;
     }
+    let pixels = unsafe { slice::from_raw_parts_mut(buffer, data_len) };
+    if !decode_rgba8(decoder, pixels) {
+        unsafe { ghostty_free(allocator, buffer, data_len) };
+        return false;
+    }
     unsafe {
-        ptr::copy_nonoverlapping(pixels.as_ptr(), buffer, pixels.len());
         *out = GhosttySysImage {
-            width: image.width(),
-            height: image.height(),
+            width,
+            height,
             data: buffer,
-            data_len: pixels.len(),
+            data_len,
         };
+    }
+    true
+}
+
+/// Decode into `out` as 8-bit RGBA. RGBA8 images decode in place; others
+/// are converted pixel by pixel from one buffer in their own format.
+fn decode_rgba8(decoder: PngDecoder<Cursor<&[u8]>>, out: &mut [u8]) -> bool {
+    if decoder.color_type() == ColorType::Rgba8 {
+        return decoder.read_image(out).is_ok();
+    }
+    let Ok(image) = DynamicImage::from_decoder(decoder) else {
+        return false;
+    };
+    for (dst, (_, _, pixel)) in out.as_chunks_mut::<4>().0.iter_mut().zip(image.pixels()) {
+        *dst = pixel.0;
     }
     true
 }
@@ -148,5 +176,41 @@ impl Terminal {
         let result =
             unsafe { ghostty_kitty_graphics_animation_tick(graphics, now_ms, &mut next_ms) };
         (result == GHOSTTY_SUCCESS).then_some(next_ms)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use image::codecs::png::PngDecoder;
+    use image::{DynamicImage, ImageFormat, RgbImage, RgbaImage};
+
+    use super::decode_rgba8;
+
+    fn png(image: DynamicImage) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        image
+            .write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)
+            .unwrap();
+        bytes
+    }
+
+    fn decode(bytes: &[u8]) -> Vec<u8> {
+        let mut out = vec![0; 2 * 4];
+        assert!(decode_rgba8(
+            PngDecoder::new(Cursor::new(bytes)).unwrap(),
+            &mut out
+        ));
+        out
+    }
+
+    #[test]
+    fn decodes_to_rgba8() {
+        let rgba = RgbaImage::from_raw(2, 1, vec![1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+        assert_eq!(decode(&png(rgba.into())), [1, 2, 3, 4, 5, 6, 7, 8]);
+        // Other formats gain an opaque alpha channel.
+        let rgb = RgbImage::from_raw(2, 1, vec![1, 2, 3, 5, 6, 7]).unwrap();
+        assert_eq!(decode(&png(rgb.into())), [1, 2, 3, 255, 5, 6, 7, 255]);
     }
 }
