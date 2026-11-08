@@ -2,24 +2,26 @@
 //! routes keyboard, IME, mouse and clipboard input between them.
 
 use std::ops::Range;
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use ghostty_sys::*;
 use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, EntityInputHandler, EventEmitter, FocusHandle, Focusable,
     Font, KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    Pixels, Point, PromptLevel, Render, ScrollDelta, ScrollWheelEvent, SharedString, Subscription,
+    Pixels, Point, PromptLevel, Render, RenderImage, ScrollDelta, ScrollWheelEvent, SharedString, Subscription,
     Task, UTF16Selection, Window, actions, div, font, point, prelude::*, px, size,
 };
 
 use crate::element::TerminalElement;
+use crate::images::ImageCache;
 use crate::keys;
 use crate::pty::{Pty, PtyEvent};
 use crate::settings::{MAX_FONT_SIZE, MIN_FONT_SIZE, Settings};
 use crate::theme;
 use crate::vt::{
-    self, Frame, GesturePoint, KeyEncoder, KeyInput, MouseEncoder, RenderState, Scrollbar,
+    self, Frame, GesturePoint, ImagePlacement, KeyEncoder, KeyInput, MouseEncoder, RenderState, Scrollbar,
     SelectionGesture, SurfaceSize, Terminal,
 };
 
@@ -42,6 +44,8 @@ pub const SCROLLBAR_WIDTH: Pixels = px(10.);
 const MIN_THUMB_HEIGHT: Pixels = px(24.);
 const MODE_FOCUS_EVENT: u16 = 1004;
 const MODE_ALTERNATE_SCROLL: u16 = 1007;
+/// Shortest wait between animation redraws (about 120 Hz).
+const MIN_FRAME_INTERVAL: Duration = Duration::from_millis(8);
 
 /// Cell grid geometry as laid out in the last frame, in window coordinates.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -51,9 +55,23 @@ pub struct GridLayout {
     pub line_height: Pixels,
     pub cols: u16,
     pub rows: u16,
+    /// Device pixels per logical pixel. The terminal and the program see
+    /// device pixels, like in Ghostty, so images are sized for the screen.
+    pub scale: f32,
 }
 
 impl GridLayout {
+    /// A logical length in whole device pixels. Cell sizes are snapped to
+    /// device pixels, so these are exact.
+    pub fn device(&self, value: Pixels) -> u32 {
+        (f32::from(value) * self.scale).round() as u32
+    }
+
+    /// A device-pixel length as a logical one.
+    pub fn logical(&self, value: f32) -> Pixels {
+        px(value / self.scale)
+    }
+
     fn grid_origin(&self) -> Point<Pixels> {
         self.bounds.origin + point(PADDING, PADDING)
     }
@@ -69,10 +87,10 @@ impl GridLayout {
         )
     }
 
-    /// Position relative to the element ("surface space") in pixels.
+    /// Position relative to the element ("surface space") in device pixels.
     fn surface_position(&self, position: Point<Pixels>) -> (f32, f32) {
         let local = position - self.bounds.origin;
-        (f32::from(local.x), f32::from(local.y))
+        (f32::from(local.x) * self.scale, f32::from(local.y) * self.scale)
     }
 
     /// The scrollbar's gutter along the element's right edge.
@@ -117,11 +135,11 @@ impl GridLayout {
 
     fn surface_size(&self) -> SurfaceSize {
         SurfaceSize {
-            width: f32::from(self.bounds.size.width - SCROLLBAR_WIDTH) as u32,
-            height: f32::from(self.bounds.size.height) as u32,
-            cell_width: f32::from(self.cell_width) as u32,
-            cell_height: f32::from(self.line_height) as u32,
-            padding: f32::from(PADDING) as u32,
+            width: self.device(self.bounds.size.width - SCROLLBAR_WIDTH),
+            height: self.device(self.bounds.size.height),
+            cell_width: self.device(self.cell_width),
+            cell_height: self.device(self.line_height),
+            padding: self.device(PADDING),
         }
     }
 }
@@ -163,6 +181,9 @@ pub struct TerminalView {
     /// Title set by the program (OSC 0/2); empty if none.
     title: SharedString,
     epoch: Instant,
+    image_cache: ImageCache,
+    /// Redraw for the next Kitty graphics animation frame.
+    animation: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
     _io: Task<()>,
 }
@@ -247,6 +268,8 @@ impl TerminalView {
             scrollbar_hovered: false,
             title: SharedString::default(),
             epoch: Instant::now(),
+            image_cache: ImageCache::default(),
+            animation: None,
             _subscriptions: subscriptions,
             _io: io,
         }
@@ -289,14 +312,21 @@ impl TerminalView {
     pub fn set_layout(&mut self, layout: GridLayout) {
         let resized = self
             .layout
-            .is_none_or(|old| (old.cols, old.rows, old.cell_width, old.line_height)
-                != (layout.cols, layout.rows, layout.cell_width, layout.line_height));
+            .is_none_or(|old| {
+                (old.cols, old.rows, old.device(old.cell_width), old.device(old.line_height))
+                    != (
+                        layout.cols,
+                        layout.rows,
+                        layout.device(layout.cell_width),
+                        layout.device(layout.line_height),
+                    )
+            });
         self.layout = Some(layout);
         if !resized {
             return;
         }
-        let cell_width = f32::from(layout.cell_width).round() as u16;
-        let cell_height = f32::from(layout.line_height).round() as u16;
+        let cell_width = layout.device(layout.cell_width) as u16;
+        let cell_height = layout.device(layout.line_height) as u16;
         self.terminal
             .resize(layout.cols, layout.rows, cell_width as u32, cell_height as u32);
         if let Some(pty) = &self.pty {
@@ -305,11 +335,31 @@ impl TerminalView {
         self.flush_replies();
     }
 
-    /// Refresh and return the frame to draw.
-    pub fn snapshot(&mut self) -> &Frame {
+    /// Refresh the frame to draw, advancing image animations first.
+    pub fn snapshot(&mut self, cx: &mut Context<Self>) -> &Frame {
+        self.tick_animations(cx);
         self.render_state.snapshot(&self.terminal, &mut self.frame);
         self.scrollbar = self.terminal.scrollbar();
         &self.frame
+    }
+
+    /// The last snapshot's images with their textures.
+    pub fn images(&mut self, window: &mut Window) -> Vec<(ImagePlacement, Arc<RenderImage>)> {
+        self.image_cache
+            .update(&self.terminal, &self.frame.images, window)
+    }
+
+    /// Show the animation frames due now and schedule a redraw for the next
+    /// one. Programs start animations by writing, which redraws anyway.
+    fn tick_animations(&mut self, cx: &mut Context<Self>) {
+        let now = self.epoch.elapsed().as_millis() as u64;
+        self.animation = self.terminal.tick_animations(now).map(|next| {
+            let delay = Duration::from_millis(next.saturating_sub(now)).max(MIN_FRAME_INTERVAL);
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(delay).await;
+                let _ = this.update(cx, |_, cx| cx.notify());
+            })
+        });
     }
 
     fn apply_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -604,9 +654,9 @@ impl TerminalView {
         };
         let geometry = GhosttySelectionGestureGeometry {
             columns: layout.cols as u32,
-            cell_width: f32::from(layout.cell_width) as u32,
-            padding_left: f32::from(PADDING) as u32,
-            screen_height: f32::from(layout.bounds.size.height) as u32,
+            cell_width: layout.device(layout.cell_width),
+            padding_left: layout.device(PADDING),
+            screen_height: layout.device(layout.bounds.size.height),
         };
         // Alt-drag selects a rectangle, like Ghostty.
         let rectangle = event.modifiers.alt;
@@ -954,6 +1004,7 @@ mod tests {
             line_height: px(16.),
             cols: 97,
             rows: 30,
+            scale: 2.,
         }
     }
 

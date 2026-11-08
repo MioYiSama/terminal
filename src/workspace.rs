@@ -1,12 +1,12 @@
-//! A terminal window: a tab bar over the active tab's terminal, plus the
-//! in-window menu bar on Windows and Linux.
+//! A terminal window: a tab bar over the active tab's terminal. On Windows
+//! and Linux the tab bar starts with the application menu button.
 
 use gpui::{
     Context, Entity, MouseButton, Pixels, SharedString, Subscription, Window, actions, div,
     prelude::*, px,
 };
 
-use crate::menu_bar::{self, MenuBar};
+use crate::menu_button::{self, MenuButton};
 use crate::settings::Settings;
 use crate::theme::UiColors;
 use crate::view::{TerminalEvent, TerminalView};
@@ -27,7 +27,7 @@ pub struct Workspace {
     /// Never empty: closing the last tab closes the window.
     tabs: Vec<Tab>,
     active: usize,
-    menu_bar: Option<Entity<MenuBar>>,
+    menu_button: Option<Entity<MenuButton>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -36,7 +36,7 @@ impl Workspace {
         let mut workspace = Self {
             tabs: Vec::new(),
             active: 0,
-            menu_bar: menu_bar::ENABLED.then(|| cx.new(|_| MenuBar::default())),
+            menu_button: menu_button::ENABLED.then(|| cx.new(|_| MenuButton::default())),
             _subscriptions: vec![
                 cx.observe_global_in::<Settings>(window, |_, _, cx| cx.notify()),
                 cx.observe_window_appearance(window, |_, _, cx| cx.notify()),
@@ -195,6 +195,7 @@ impl Workspace {
             .border_b_1()
             .border_color(colors.border)
             .text_sm()
+            .children(self.menu_button.clone())
             .children(tabs)
             .child(new_tab)
     }
@@ -217,7 +218,6 @@ impl Render for Workspace {
             .on_action(cx.listener(|workspace, _: &PreviousTab, window, cx| {
                 workspace.cycle(false, window, cx)
             }))
-            .children(self.menu_bar.clone())
             .child(self.render_tab_bar(colors, cx))
             .child(
                 div()

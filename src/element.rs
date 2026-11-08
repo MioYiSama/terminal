@@ -5,8 +5,10 @@
 //! box drawing and block elements instead fill device-aligned cell geometry,
 //! independent of font advances and the extra spacing between text rows.
 
+use std::sync::Arc;
+
 use gpui::{
-    App, BorderStyle, Bounds, ContentMask, CursorStyle, Element, ElementId, Entity, Focusable,
+    App, BorderStyle, Bounds, ContentMask, Corners, CursorStyle, Element, RenderImage, ElementId, Entity, Focusable,
     GlobalElementId, Hitbox, HitboxBehavior, Hsla, InspectorElementId, IntoElement, LayoutId,
     MouseMoveEvent, PaintQuad, Pixels, Point, Rgba, ShapedLine, SharedString, Style, TextRun,
     UnderlineStyle, Window, DispatchPhase, fill, outline, point, px, relative, size,
@@ -14,7 +16,7 @@ use gpui::{
 
 use crate::box_drawing;
 use crate::view::{GridLayout, PADDING, SCROLLBAR_WIDTH, TerminalInputHandler, TerminalView};
-use crate::vt::{CursorShape, Frame, Rgb, Underline};
+use crate::vt::{CursorShape, Frame, ImageLayer, ImagePlacement, Rgb, Underline};
 
 pub struct TerminalElement {
     view: Entity<TerminalView>,
@@ -74,6 +76,77 @@ pub struct Prepared {
     marked: Option<(Point<Pixels>, ShapedLine, PaintQuad)>,
     /// Scrollbar thumb, and the track's hitbox for the arrow cursor.
     scrollbar: Option<(PaintQuad, Hitbox)>,
+    /// Kitty graphics, sorted by layer and then z-index.
+    images: Vec<ImageDraw>,
+}
+
+struct ImageDraw {
+    layer: ImageLayer,
+    image: Arc<RenderImage>,
+    /// Where the whole image would land, so the source rectangle ends up
+    /// in `clip`.
+    bounds: Bounds<Pixels>,
+    /// The placement's destination, limited to the grid.
+    clip: Bounds<Pixels>,
+}
+
+/// Lay out the placements' images over the grid in window coordinates.
+fn image_draws(
+    layout: GridLayout,
+    mut placements: Vec<(ImagePlacement, Arc<RenderImage>)>,
+) -> Vec<ImageDraw> {
+    placements.sort_by_key(|(p, _)| (p.layer, p.z));
+    let origin = layout.bounds.origin + point(PADDING, PADDING);
+    let grid = Bounds::new(
+        origin,
+        size(
+            layout.cell_width * layout.cols as f32,
+            layout.line_height * layout.rows as f32,
+        ),
+    );
+    placements
+        .into_iter()
+        .filter_map(|(p, image)| {
+            if p.source_width == 0 || p.source_height == 0 {
+                return None;
+            }
+            let dest = Bounds::new(
+                origin
+                    + point(
+                        layout.cell_width * p.col as f32 + layout.logical(p.offset_x as f32),
+                        layout.line_height * p.row as f32 + layout.logical(p.offset_y as f32),
+                    ),
+                size(layout.logical(p.width as f32), layout.logical(p.height as f32)),
+            );
+            let clip = dest.intersect(&grid);
+            if clip.is_empty() {
+                return None;
+            }
+            // Logical pixels per source pixel on each axis.
+            let scale_x = f32::from(dest.size.width) / p.source_width as f32;
+            let scale_y = f32::from(dest.size.height) / p.source_height as f32;
+            let full = image.size(0);
+            let bounds = Bounds::new(
+                dest.origin - point(px(p.source_x as f32 * scale_x), px(p.source_y as f32 * scale_y)),
+                size(px(full.width.0 as f32 * scale_x), px(full.height.0 as f32 * scale_y)),
+            );
+            Some(ImageDraw {
+                layer: p.layer,
+                image,
+                bounds,
+                clip,
+            })
+        })
+        .collect()
+}
+
+/// Paint the images in `layer`, which `images` holds as one sorted run.
+fn paint_images(images: &[ImageDraw], layer: ImageLayer, window: &mut Window) {
+    for draw in images.iter().filter(|draw| draw.layer == layer) {
+        window.with_content_mask(Some(ContentMask { bounds: draw.clip }), |window| {
+            let _ = window.paint_image(draw.bounds, Corners::default(), draw.image.clone(), 0, false);
+        });
+    }
 }
 
 impl IntoElement for TerminalElement {
@@ -118,7 +191,7 @@ impl Element for TerminalElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
-        self.view.update(cx, |view, _cx| {
+        self.view.update(cx, |view, cx| {
             let text_system = window.text_system().clone();
             let scale = window.scale_factor();
             let font = view.font();
@@ -148,6 +221,7 @@ impl Element for TerminalElement {
                 line_height,
                 cols,
                 rows,
+                scale,
             };
             view.set_layout(layout);
 
@@ -159,7 +233,7 @@ impl Element for TerminalElement {
                 font.clone().italic(),
                 font.bold().italic(),
             ];
-            let frame = view.snapshot();
+            let frame = view.snapshot(cx);
             let foreground = hsla(frame.foreground);
             let mut prepared = build(
                 frame,
@@ -173,6 +247,7 @@ impl Element for TerminalElement {
                 marked_text,
                 window,
             );
+            prepared.images = image_draws(layout, view.images(window));
             prepared.scrollbar = view.scrollbar_thumb().map(|(slot, highlighted)| {
                 let thumb = Bounds::new(
                     point(
@@ -218,9 +293,11 @@ impl Element for TerminalElement {
 
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
             window.paint_quad(fill(bounds, prepared.background));
+            paint_images(&prepared.images, ImageLayer::BelowBackground, window);
             for quad in prepared.backgrounds.drain(..) {
                 window.paint_quad(quad);
             }
+            paint_images(&prepared.images, ImageLayer::BelowText, window);
             if let Some(quad) = prepared.cursor_block.take() {
                 window.paint_quad(quad);
             }
@@ -294,6 +371,7 @@ impl Element for TerminalElement {
             for quad in prepared.decorations.drain(..) {
                 window.paint_quad(quad);
             }
+            paint_images(&prepared.images, ImageLayer::AboveText, window);
             if let Some(quad) = prepared.cursor_overlay.take() {
                 window.paint_quad(quad);
             }
@@ -513,6 +591,7 @@ fn build(
         cursor_text,
         marked,
         scrollbar: None,
+        images: Vec::new(),
     }
 }
 

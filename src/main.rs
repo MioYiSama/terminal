@@ -6,8 +6,9 @@ mod app_icon;
 mod box_drawing;
 mod element;
 mod i18n;
+mod images;
 mod keys;
-mod menu_bar;
+mod menu_button;
 mod pty;
 mod settings;
 mod settings_view;
@@ -148,6 +149,7 @@ fn set_menus(cx: &mut App) {
 }
 
 fn main() {
+    vt::install_png_decoder();
     Application::new().run(|cx: &mut App| {
         // Quit when the last window closes (macOS keeps apps alive otherwise).
         cx.on_window_closed(|cx| {

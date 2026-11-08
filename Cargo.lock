@@ -5490,6 +5490,7 @@ dependencies = [
  "futures",
  "ghostty-sys",
  "gpui",
+ "image",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",

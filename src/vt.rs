@@ -8,6 +8,77 @@ use std::ops::Range;
 
 use ghostty_sys::*;
 
+/// Scrollback budget per terminal. Cells take 8 bytes, so this is about
+/// 290,000 rows at 200 columns; pages are allocated as history grows.
+const SCROLLBACK_MAX_BYTES: usize = 500_000_000;
+/// Kitty graphics storage per screen, Ghostty's `image-storage-limit`
+/// default.
+const KITTY_IMAGE_STORAGE_LIMIT: u64 = 320_000_000;
+/// Character that places a Kitty graphics image with text (virtual
+/// placements).
+const KITTY_PLACEHOLDER: char = '\u{10EEEE}';
+
+/// Decode Kitty graphics PNG payloads with the `image` crate. libghostty
+/// ships no decoder and rejects PNG images until one is installed.
+/// Process-global: call once at startup, before any terminal exists.
+pub fn install_png_decoder() {
+    let decode: unsafe extern "C" fn(
+        *mut c_void,
+        *const GhosttyAllocator,
+        *const u8,
+        usize,
+        *mut GhosttySysImage,
+    ) -> bool = decode_png;
+    unsafe { ghostty_sys_set(GHOSTTY_SYS_OPT_DECODE_PNG, decode as *const c_void) };
+}
+
+unsafe extern "C" fn decode_png(
+    _userdata: *mut c_void,
+    allocator: *const GhosttyAllocator,
+    data: *const u8,
+    len: usize,
+    out: *mut GhosttySysImage,
+) -> bool {
+    let bytes = unsafe { slice::from_raw_parts(data, len) };
+    let Ok(image) = image::load_from_memory_with_format(bytes, image::ImageFormat::Png) else {
+        return false;
+    };
+    let image = image.into_rgba8();
+    let pixels = image.as_raw();
+    // The allocator caps one image's memory: NULL means too large.
+    let buffer = unsafe { ghostty_alloc(allocator, pixels.len()) };
+    if buffer.is_null() {
+        return false;
+    }
+    unsafe {
+        ptr::copy_nonoverlapping(pixels.as_ptr(), buffer, pixels.len());
+        *out = GhosttySysImage {
+            width: image.width(),
+            height: image.height(),
+            data: buffer,
+            data_len: pixels.len(),
+        };
+    }
+    true
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KittyImageFormat {
+    Rgb,
+    Rgba,
+    GrayAlpha,
+    Gray,
+}
+
+/// Decoded pixels of a Kitty graphics image (its current animation frame),
+/// rows top to bottom without padding.
+pub struct KittyImage<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub format: KittyImageFormat,
+    pub pixels: &'a [u8],
+}
+
 /// A zeroed "sized struct" (`GHOSTTY_INIT_SIZED`) with its `size` field set.
 macro_rules! sized {
     ($ty:ty) => {{
@@ -134,6 +205,22 @@ impl Terminal {
                 title_changed as *const c_void,
             );
             ghostty_terminal_set(raw, GHOSTTY_TERMINAL_OPT_SIZE, size as *const c_void);
+            // libghostty's default keeps a single page of history, a few
+            // hundred rows.
+            ghostty_terminal_set(
+                raw,
+                GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_BYTES,
+                &SCROLLBACK_MAX_BYTES as *const usize as *const c_void,
+            );
+            // ConPTY repaints its own scrollback-less screen after a resize;
+            // pulling history rows back into view would make the two disagree
+            // and the repaint would overwrite them.
+            #[cfg(windows)]
+            ghostty_terminal_set(
+                raw,
+                GHOSTTY_TERMINAL_OPT_RESIZE_PULL_SCROLLBACK,
+                &false as *const bool as *const c_void,
+            );
             // Grapheme clustering (mode 2027) on by default, as in Ghostty:
             // emoji sequences and modifiers occupy one cell instead of several.
             let grapheme_cluster = GhosttyTerminalModeConfig {
@@ -145,8 +232,114 @@ impl Terminal {
                 GHOSTTY_TERMINAL_OPT_MODE_DEFAULT,
                 &grapheme_cluster as *const _ as *const c_void,
             );
+            // Kitty graphics, configured like Ghostty: its storage limit,
+            // and every transmission medium, temporary files only from the
+            // temp directory programs started here inherit.
+            ghostty_terminal_set(
+                raw,
+                GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_STORAGE_LIMIT,
+                &KITTY_IMAGE_STORAGE_LIMIT as *const u64 as *const c_void,
+            );
+            for option in [
+                GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_MEDIUM_FILE,
+                GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_MEDIUM_SHARED_MEM,
+            ] {
+                ghostty_terminal_set(raw, option, &true as *const bool as *const c_void);
+            }
+            let temp_dir = std::env::temp_dir();
+            let temp_dir = temp_dir.to_string_lossy();
+            let temp_dir = GhosttyString {
+                ptr: temp_dir.as_ptr(),
+                len: temp_dir.len(),
+            };
+            ghostty_terminal_set(
+                raw,
+                GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_MEDIUM_TEMP_FILE,
+                &temp_dir as *const GhosttyString as *const c_void,
+            );
         }
         Self { raw, effects }
+    }
+
+    /// The active screen's Kitty graphics storage. Borrowed: valid until the
+    /// terminal is next modified.
+    fn kitty_graphics(&self) -> Option<GhosttyKittyGraphics> {
+        let mut graphics: GhosttyKittyGraphics = ptr::null_mut();
+        let result = unsafe {
+            ghostty_terminal_get(
+                self.raw,
+                GHOSTTY_TERMINAL_DATA_KITTY_GRAPHICS,
+                &mut graphics as *mut GhosttyKittyGraphics as *mut c_void,
+            )
+        };
+        (result == GHOSTTY_SUCCESS && !graphics.is_null()).then_some(graphics)
+    }
+
+    /// The Kitty graphics image `id` on the active screen, if it exists and
+    /// its pixels have arrived.
+    pub fn kitty_image(&self, id: u32) -> Option<KittyImage<'_>> {
+        let graphics = self.kitty_graphics()?;
+        let image = unsafe { ghostty_kitty_graphics_image(graphics, id) };
+        if image.is_null() {
+            return None;
+        }
+        let mut width = 0u32;
+        let mut height = 0u32;
+        let mut format: GhosttyKittyImageFormat = GHOSTTY_KITTY_IMAGE_FORMAT_RGBA;
+        let mut pixels = GhosttyString {
+            ptr: ptr::null(),
+            len: 0,
+        };
+        let keys = [
+            GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_WIDTH,
+            GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_HEIGHT,
+            GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_FORMAT,
+            GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_PIXELS,
+        ];
+        let mut values = [
+            &mut width as *mut u32 as *mut c_void,
+            &mut height as *mut u32 as *mut c_void,
+            &mut format as *mut GhosttyKittyImageFormat as *mut c_void,
+            &mut pixels as *mut GhosttyString as *mut c_void,
+        ];
+        let result = unsafe {
+            ghostty_kitty_graphics_image_get_multi(
+                image,
+                keys.len(),
+                keys.as_ptr(),
+                values.as_mut_ptr(),
+                ptr::null_mut(),
+            )
+        };
+        if result != GHOSTTY_SUCCESS || pixels.ptr.is_null() {
+            return None;
+        }
+        let format = match format {
+            GHOSTTY_KITTY_IMAGE_FORMAT_RGB => KittyImageFormat::Rgb,
+            GHOSTTY_KITTY_IMAGE_FORMAT_RGBA => KittyImageFormat::Rgba,
+            GHOSTTY_KITTY_IMAGE_FORMAT_GRAY_ALPHA => KittyImageFormat::GrayAlpha,
+            GHOSTTY_KITTY_IMAGE_FORMAT_GRAY => KittyImageFormat::Gray,
+            _ => return None,
+        };
+        Some(KittyImage {
+            width,
+            height,
+            format,
+            // SAFETY: owned by the terminal and valid until it is next
+            // modified, which needs `&mut self`.
+            pixels: unsafe { slice::from_raw_parts(pixels.ptr, pixels.len) },
+        })
+    }
+
+    /// Advance playing Kitty graphics animations to `now_ms` (any clock
+    /// with a fixed start). Returns when the next frame is due on that
+    /// clock, or `None` if nothing is playing.
+    pub fn tick_animations(&mut self, now_ms: u64) -> Option<u64> {
+        let graphics = self.kitty_graphics()?;
+        let mut next_ms = 0u64;
+        let result =
+            unsafe { ghostty_kitty_graphics_animation_tick(graphics, now_ms, &mut next_ms) };
+        (result == GHOSTTY_SUCCESS).then_some(next_ms)
     }
 
     fn effects(&mut self) -> &mut Effects {
@@ -481,12 +674,54 @@ pub struct Frame {
     pub foreground: Rgb,
     pub cursor: Option<Cursor>,
     pub lines: Vec<Line>,
+    /// Kitty graphics placements touching the viewport, in no particular
+    /// order.
+    pub images: Vec<ImagePlacement>,
+}
+
+/// Where an image is drawn relative to the cell grid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ImageLayer {
+    BelowBackground,
+    BelowText,
+    AboveText,
+}
+
+/// One rectangle of one Kitty graphics image to draw. Pixel values use the
+/// cell size given to [`Terminal::resize`].
+#[derive(Clone, Copy, Debug)]
+pub struct ImagePlacement {
+    pub image_id: u32,
+    /// Changes whenever the image's pixels do (new data, animation frame).
+    pub generation: u64,
+    pub layer: ImageLayer,
+    /// Draw order within the layer, lowest first.
+    pub z: i32,
+    /// Top-left cell relative to the viewport; can be negative when the
+    /// image starts above or left of it.
+    pub col: i32,
+    pub row: i32,
+    /// Offset of the image within its top-left cell.
+    pub offset_x: u32,
+    pub offset_y: u32,
+    /// Size to draw at.
+    pub width: u32,
+    pub height: u32,
+    /// Part of the image to draw, in image pixels, scaled to `width` x
+    /// `height`.
+    pub source_x: u32,
+    pub source_y: u32,
+    pub source_width: u32,
+    pub source_height: u32,
 }
 
 pub struct RenderState {
     raw: GhosttyRenderState,
     rows: GhosttyRenderStateRowIterator,
     cells: GhosttyRenderStateRowCells,
+    images: GhosttyRenderStateImageIterator,
+    /// Placements generation `Frame::images` was last read at.
+    images_generation: Option<u64>,
 }
 
 impl RenderState {
@@ -494,8 +729,13 @@ impl RenderState {
         let mut raw = ptr::null_mut();
         let mut rows = ptr::null_mut();
         let mut cells = ptr::null_mut();
+        let mut images = ptr::null_mut();
         unsafe {
             assert_eq!(ghostty_render_state_new(ptr::null(), &mut raw), GHOSTTY_SUCCESS);
+            assert_eq!(
+                ghostty_render_state_image_iterator_new(ptr::null(), &mut images),
+                GHOSTTY_SUCCESS
+            );
             assert_eq!(
                 ghostty_render_state_row_iterator_new(ptr::null(), &mut rows),
                 GHOSTTY_SUCCESS
@@ -505,7 +745,120 @@ impl RenderState {
                 GHOSTTY_SUCCESS
             );
         }
-        Self { raw, rows, cells }
+        Self {
+            raw,
+            rows,
+            cells,
+            images,
+            images_generation: None,
+        }
+    }
+
+    /// Re-read the image placements if the last update changed them.
+    fn read_images(&mut self, out: &mut Vec<ImagePlacement>) {
+        let mut generation = 0u64;
+        unsafe {
+            ghostty_render_state_get(
+                self.raw,
+                GHOSTTY_RENDER_STATE_DATA_IMAGE_PLACEMENTS_GENERATION,
+                &mut generation as *mut u64 as *mut c_void,
+            );
+        }
+        if self.images_generation == Some(generation) {
+            return;
+        }
+        self.images_generation = Some(generation);
+        out.clear();
+        let result = unsafe {
+            ghostty_render_state_get(
+                self.raw,
+                GHOSTTY_RENDER_STATE_DATA_IMAGE_ITERATOR,
+                &mut self.images as *mut _ as *mut c_void,
+            )
+        };
+        if result != GHOSTTY_SUCCESS {
+            return;
+        }
+        while unsafe { ghostty_render_state_image_iterator_next(self.images) } {
+            let mut protocol: GhosttyImageProtocol = GHOSTTY_IMAGE_PROTOCOL_KITTY;
+            unsafe {
+                ghostty_render_state_image_get(
+                    self.images,
+                    GHOSTTY_RENDER_STATE_IMAGE_DATA_PROTOCOL,
+                    &mut protocol as *mut _ as *mut c_void,
+                );
+            }
+            if protocol != GHOSTTY_IMAGE_PROTOCOL_KITTY {
+                continue;
+            }
+            let mut layer: GhosttyImageLayer = GHOSTTY_IMAGE_LAYER_ABOVE_TEXT;
+            let mut p = ImagePlacement {
+                image_id: 0,
+                generation: 0,
+                layer: ImageLayer::AboveText,
+                z: 0,
+                col: 0,
+                row: 0,
+                offset_x: 0,
+                offset_y: 0,
+                width: 0,
+                height: 0,
+                source_x: 0,
+                source_y: 0,
+                source_width: 0,
+                source_height: 0,
+            };
+            let keys = [
+                GHOSTTY_RENDER_STATE_IMAGE_DATA_IMAGE_ID,
+                GHOSTTY_RENDER_STATE_IMAGE_DATA_IMAGE_GENERATION,
+                GHOSTTY_RENDER_STATE_IMAGE_DATA_LAYER,
+                GHOSTTY_RENDER_STATE_IMAGE_DATA_Z,
+                GHOSTTY_RENDER_STATE_IMAGE_DATA_VIEWPORT_COL,
+                GHOSTTY_RENDER_STATE_IMAGE_DATA_VIEWPORT_ROW,
+                GHOSTTY_RENDER_STATE_IMAGE_DATA_CELL_OFFSET_X,
+                GHOSTTY_RENDER_STATE_IMAGE_DATA_CELL_OFFSET_Y,
+                GHOSTTY_RENDER_STATE_IMAGE_DATA_PIXEL_WIDTH,
+                GHOSTTY_RENDER_STATE_IMAGE_DATA_PIXEL_HEIGHT,
+                GHOSTTY_RENDER_STATE_IMAGE_DATA_SOURCE_X,
+                GHOSTTY_RENDER_STATE_IMAGE_DATA_SOURCE_Y,
+                GHOSTTY_RENDER_STATE_IMAGE_DATA_SOURCE_WIDTH,
+                GHOSTTY_RENDER_STATE_IMAGE_DATA_SOURCE_HEIGHT,
+            ];
+            let mut values: [*mut c_void; 14] = [
+                &mut p.image_id as *mut u32 as *mut c_void,
+                &mut p.generation as *mut u64 as *mut c_void,
+                &mut layer as *mut GhosttyImageLayer as *mut c_void,
+                &mut p.z as *mut i32 as *mut c_void,
+                &mut p.col as *mut i32 as *mut c_void,
+                &mut p.row as *mut i32 as *mut c_void,
+                &mut p.offset_x as *mut u32 as *mut c_void,
+                &mut p.offset_y as *mut u32 as *mut c_void,
+                &mut p.width as *mut u32 as *mut c_void,
+                &mut p.height as *mut u32 as *mut c_void,
+                &mut p.source_x as *mut u32 as *mut c_void,
+                &mut p.source_y as *mut u32 as *mut c_void,
+                &mut p.source_width as *mut u32 as *mut c_void,
+                &mut p.source_height as *mut u32 as *mut c_void,
+            ];
+            let result = unsafe {
+                ghostty_render_state_image_get_multi(
+                    self.images,
+                    keys.len(),
+                    keys.as_ptr(),
+                    values.as_mut_ptr(),
+                    ptr::null_mut(),
+                )
+            };
+            if result != GHOSTTY_SUCCESS {
+                continue;
+            }
+            p.layer = match layer {
+                GHOSTTY_IMAGE_LAYER_BELOW_BACKGROUND => ImageLayer::BelowBackground,
+                GHOSTTY_IMAGE_LAYER_BELOW_TEXT => ImageLayer::BelowText,
+                _ => ImageLayer::AboveText,
+            };
+            out.push(p);
+        }
     }
 
     fn cell_get<T>(&self, data: GhosttyRenderStateRowCellsData, out: &mut T) -> GhosttyResult {
@@ -635,6 +988,11 @@ impl RenderState {
                             push_utf8(&mut line.text, &big[..buf.len]);
                         }
                     }
+                    // Kitty graphics placeholders stand for the image the
+                    // render state reports; they have no glyph of their own.
+                    if line.text[start as usize..].starts_with(KITTY_PLACEHOLDER) {
+                        line.text.truncate(start as usize);
+                    }
                     cell.text = start..line.text.len() as u32;
                 }
 
@@ -717,6 +1075,8 @@ impl RenderState {
             }
         });
 
+        self.read_images(&mut frame.images);
+
         unsafe { ghostty_render_state_clean(self.raw) };
     }
 }
@@ -731,6 +1091,7 @@ fn push_utf8(out: &mut String, bytes: &[u8]) {
 impl Drop for RenderState {
     fn drop(&mut self) {
         unsafe {
+            ghostty_render_state_image_iterator_free(self.images);
             ghostty_render_state_row_cells_free(self.cells);
             ghostty_render_state_row_iterator_free(self.rows);
             ghostty_render_state_free(self.raw);
@@ -1058,5 +1419,20 @@ impl Drop for SelectionGesture {
             ghostty_selection_gesture_event_free(self.release);
             ghostty_selection_gesture_free(self.gesture, self.terminal);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scrollback_keeps_thousands_of_rows() {
+        let mut terminal = Terminal::new(80, 24);
+        for i in 0..3000 {
+            terminal.vt_write(format!("line {i}\r\n").as_bytes());
+        }
+        // 3000 lines plus the empty row holding the cursor.
+        assert_eq!(terminal.scrollbar().total, 3001);
     }
 }
