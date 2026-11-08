@@ -1,0 +1,15 @@
+[package]
+name = "ghostty-sys"
+version = "0.1.0"
+edition = "2024"
+description = "Raw FFI bindings to libghostty-vt, built from source with Zig"
+license = "MIT"
+links = "ghostty-vt"
+
+[lib]
+# Doc comments are copied verbatim from the C headers; their indented
+# examples are C, not Rust.
+doctest = false
+
+[build-dependencies]
+bindgen = "0.73"
