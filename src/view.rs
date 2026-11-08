@@ -9,14 +9,16 @@ use futures::StreamExt;
 use ghostty_sys::*;
 use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, EntityInputHandler, EventEmitter, FocusHandle, Focusable,
-    Font, KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    Font, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     Pixels, Point, PromptLevel, Render, RenderImage, ScrollDelta, ScrollWheelEvent, SharedString, Subscription,
     Task, UTF16Selection, Window, actions, div, font, point, prelude::*, px, size,
 };
 
+use crate::clipboard::{self, Content};
 use crate::element::TerminalElement;
 use crate::images::ImageCache;
 use crate::keys;
+use crate::links::{self, Link};
 use crate::pty::{Pty, PtyEvent};
 use crate::settings::{MAX_FONT_SIZE, MIN_FONT_SIZE, Settings};
 use crate::theme;
@@ -74,6 +76,15 @@ impl GridLayout {
 
     fn grid_origin(&self) -> Point<Pixels> {
         self.bounds.origin + point(PADDING, PADDING)
+    }
+
+    /// Cell under a window-space position, or `None` outside the grid.
+    fn cell_containing(&self, position: Point<Pixels>) -> Option<(u16, u16)> {
+        let local = position - self.grid_origin();
+        let col = (f32::from(local.x) / f32::from(self.cell_width)).floor();
+        let row = (f32::from(local.y) / f32::from(self.line_height)).floor();
+        (col >= 0. && row >= 0. && col < self.cols as f32 && row < self.rows as f32)
+            .then_some((col as u16, row as u16))
     }
 
     /// Cell under a window-space position, clamped to the grid.
@@ -178,6 +189,12 @@ pub struct TerminalView {
     /// thumb's top edge.
     scrollbar_drag: Option<Pixels>,
     scrollbar_hovered: bool,
+    /// Last pointer position in window coordinates.
+    pointer: Option<Point<Pixels>>,
+    /// Cmd (Ctrl off macOS) is held: links in the text are found too, and
+    /// links open on click.
+    link_modifier: bool,
+    hovered_link: Option<Link>,
     /// Title set by the program (OSC 0/2); empty if none.
     title: SharedString,
     epoch: Instant,
@@ -266,6 +283,9 @@ impl TerminalView {
             scrollbar: Scrollbar::default(),
             scrollbar_drag: None,
             scrollbar_hovered: false,
+            pointer: None,
+            link_modifier: false,
+            hovered_link: None,
             title: SharedString::default(),
             epoch: Instant::now(),
             image_cache: ImageCache::default(),
@@ -340,7 +360,63 @@ impl TerminalView {
         self.tick_animations(cx);
         self.render_state.snapshot(&self.terminal, &mut self.frame);
         self.scrollbar = self.terminal.scrollbar();
+        // Output may have moved or replaced the link under the pointer.
+        self.hovered_link = self.link_under_pointer();
         &self.frame
+    }
+
+    /// The link to underline and preview, as of the last frame.
+    pub fn hovered_link(&self) -> Option<&Link> {
+        self.hovered_link.as_ref()
+    }
+
+    /// Whether a click would open the hovered link.
+    pub fn link_clickable(&self) -> bool {
+        self.link_modifier
+    }
+
+    /// OSC 8 hyperlinks are shown on hover; URLs and paths in the text only
+    /// while the link modifier is held, since finding them is a guess.
+    fn link_under_pointer(&self) -> Option<Link> {
+        let (col, row) = self.layout?.cell_containing(self.pointer?)?;
+        let text_links = self
+            .link_modifier
+            .then_some(|| self.pty.as_ref()?.foreground_cwd());
+        links::link_at(&self.terminal, &self.frame, col, row, text_links)
+    }
+
+    /// The pointer left the window.
+    pub fn mouse_exit(&mut self, cx: &mut Context<Self>) {
+        self.pointer = None;
+        self.update_hovered_link(cx);
+    }
+
+    fn update_hovered_link(&mut self, cx: &mut Context<Self>) {
+        let link = self.link_under_pointer();
+        if link != self.hovered_link {
+            self.hovered_link = link;
+            cx.notify();
+        }
+    }
+
+    fn modifiers_changed(
+        &mut self,
+        event: &ModifiersChangedEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_link_modifier(event.modifiers.secondary(), cx);
+    }
+
+    fn set_link_modifier(&mut self, held: bool, cx: &mut Context<Self>) {
+        if held != self.link_modifier {
+            self.link_modifier = held;
+            // A hovered link's cursor changes even when the link stays.
+            if self.hovered_link.is_some() {
+                cx.notify();
+            }
+        }
+        self.update_hovered_link(cx);
     }
 
     /// The last snapshot's images with their textures.
@@ -425,9 +501,22 @@ impl TerminalView {
 
     // ---- keyboard ---------------------------------------------------------
 
-    fn key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         // While the IME is composing, it owns every key.
         if !self.marked_text.is_empty() {
+            return;
+        }
+        // Ctrl+V pastes copied files and images as paths. Otherwise it stays
+        // a key for the program (^V: literal next in shells, block selection
+        // in Vim), which may read an image from the clipboard itself.
+        let m = &event.keystroke.modifiers;
+        if event.keystroke.key == "v"
+            && m.control
+            && !(m.shift || m.alt || m.platform || m.function)
+            && let Some(content @ (Content::Paths(_) | Content::Image(_))) = clipboard::read(cx)
+        {
+            cx.stop_propagation();
+            self.paste_content(content, window, cx);
             return;
         }
         let mut text = String::new();
@@ -474,9 +563,32 @@ impl TerminalView {
     }
 
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
-            return;
+        if let Some(content) = clipboard::read(cx) {
+            self.paste_content(content, window, cx);
+        }
+    }
+
+    fn paste_content(&mut self, content: Content, window: &mut Window, cx: &mut Context<Self>) {
+        let image = match content {
+            Content::Paths(text) | Content::Text(text) => {
+                return self.paste_or_confirm(text, window, cx);
+            }
+            Content::Image(image) => image,
         };
+        // Saving may mean converting a large TIFF: keep it off the UI thread.
+        let saved = cx
+            .background_executor()
+            .spawn(async move { clipboard::save_image(&image) });
+        cx.spawn_in(window, async move |this, cx| match saved.await {
+            Ok(path) => {
+                let _ = this.update_in(cx, |view, window, cx| view.paste_or_confirm(path, window, cx));
+            }
+            Err(err) => eprintln!("failed to save the clipboard image: {err}"),
+        })
+        .detach();
+    }
+
+    fn paste_or_confirm(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
         if self.paste_text(&text, false, cx) {
             return;
         }
@@ -593,6 +705,16 @@ impl TerminalView {
         if self.scrollbar_press(event, cx) {
             return;
         }
+        // Cmd+click (Ctrl+click off macOS) opens a link, even over programs
+        // that use the mouse.
+        if event.button == MouseButton::Left && event.modifiers.secondary() {
+            self.pointer = Some(event.position);
+            self.link_modifier = true;
+            if let Some(link) = self.link_under_pointer() {
+                cx.open_url(&link.url);
+                return;
+            }
+        }
         if self.reports_mouse(event.modifiers.shift) {
             let button = ghostty_button(event.button);
             self.reported_button = Some(button);
@@ -623,6 +745,8 @@ impl TerminalView {
     /// pointer leaves the terminal.
     pub fn mouse_move(&mut self, event: &MouseMoveEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let Some(layout) = self.layout else { return };
+        self.pointer = Some(event.position);
+        self.set_link_modifier(event.modifiers.secondary(), cx);
         if let Some(grab) = self.scrollbar_drag {
             let offset = layout.scrollbar_offset_at(self.scrollbar, event.position.y - grab);
             self.terminal.scroll_to_row(offset);
@@ -898,6 +1022,7 @@ impl Render for TerminalView {
             }))
             .on_key_down(cx.listener(Self::key_down))
             .on_key_up(cx.listener(Self::key_up))
+            .on_modifiers_changed(cx.listener(Self::modifiers_changed))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
             .on_mouse_down(MouseButton::Right, cx.listener(Self::mouse_down))
             .on_mouse_down(MouseButton::Middle, cx.listener(Self::mouse_down))

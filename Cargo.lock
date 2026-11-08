@@ -5499,6 +5499,7 @@ dependencies = [
  "serde_json",
  "sys-locale",
  "unicode-segmentation",
+ "windows 0.61.3",
 ]
 
 [[package]]

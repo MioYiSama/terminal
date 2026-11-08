@@ -20,14 +20,15 @@ pub struct PtySize {
     pub pixel_height: u16,
 }
 
-/// What to run inside the pty. The child inherits the current environment,
-/// with `env` entries layered on top.
+/// What to run inside the pty. The child inherits the current environment
+/// minus `env_remove` names, with `env` entries layered on top.
 #[derive(Clone, Debug)]
 pub struct Command {
     /// `None` runs the user's default shell (a login shell on Unix).
     program: Option<OsString>,
     args: Vec<OsString>,
     env: Vec<(OsString, OsString)>,
+    env_remove: Vec<OsString>,
     cwd: Option<PathBuf>,
 }
 
@@ -48,6 +49,7 @@ impl Command {
             program,
             args: Vec::new(),
             env: Vec::new(),
+            env_remove: Vec::new(),
             cwd: None,
         }
     }
@@ -59,6 +61,12 @@ impl Command {
 
     pub fn env(&mut self, key: impl Into<OsString>, value: impl Into<OsString>) -> &mut Self {
         self.env.push((key.into(), value.into()));
+        self
+    }
+
+    /// Do not pass the inherited variable `key` on.
+    pub fn env_remove(&mut self, key: impl Into<OsString>) -> &mut Self {
+        self.env_remove.push(key.into());
         self
     }
 
@@ -90,6 +98,13 @@ impl Master {
 
     pub fn resize(&self, size: PtySize) -> io::Result<()> {
         self.0.resize(size)
+    }
+
+    /// The working directory of the process in the foreground of the
+    /// terminal (the shell, or the program it is running), where known.
+    /// Always `None` on Windows.
+    pub fn foreground_cwd(&self) -> Option<PathBuf> {
+        self.0.foreground_cwd()
     }
 }
 

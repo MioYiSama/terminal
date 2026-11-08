@@ -30,11 +30,44 @@ fn pty_size(cols: u16, rows: u16, cell_width: u16, cell_height: u16) -> PtySize 
     }
 }
 
-fn home_dir() -> Option<PathBuf> {
+pub fn home_dir() -> Option<PathBuf> {
     let var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
     std::env::var_os(var)
         .map(PathBuf::from)
         .filter(|path| path.is_dir())
+}
+
+/// Whether the inherited variable `name` describes the terminal or multiplexer
+/// this app was launched from, e.g. a terminal pane in an editor. Programs
+/// detect their terminal from these before `TERM_PROGRAM`, so passed on they
+/// would mistake this terminal for that one.
+fn describes_another_terminal(name: &str) -> bool {
+    const PREFIXES: [&str; 10] = [
+        "ALACRITTY_",
+        "GHOSTTY_",
+        "ITERM_",
+        "KITTY_",
+        "KONSOLE_",
+        "VSCODE_",
+        "WEZTERM_",
+        "WT_",
+        "ZED_",
+        "ZELLIJ",
+    ];
+    const NAMES: [&str; 11] = [
+        "COLORFGBG",
+        "LC_TERMINAL",
+        "LC_TERMINAL_VERSION",
+        "STY",
+        "TERMINAL_EMULATOR",
+        "TERM_FEATURES",
+        "TERM_PROGRAM_VERSION",
+        "TERM_SESSION_ID",
+        "TMUX",
+        "TMUX_PANE",
+        "VTE_VERSION",
+    ];
+    PREFIXES.iter().any(|prefix| name.starts_with(prefix)) || NAMES.contains(&name)
 }
 
 impl Pty {
@@ -48,9 +81,18 @@ impl Pty {
         cell_height: u16,
     ) -> Result<(Self, UnboundedReceiver<PtyEvent>), String> {
         let mut cmd = program.map_or_else(Command::default_shell, Command::new);
+        for (name, _) in std::env::vars_os() {
+            if name.to_str().is_some_and(describes_another_terminal) {
+                cmd.env_remove(name);
+            }
+        }
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
-        cmd.env("TERM_PROGRAM", env!("CARGO_PKG_NAME"));
+        // The terminal is libghostty, so programs that pick features by
+        // terminal (Kitty graphics with Unicode placeholders, OSC 8, …) get
+        // them by recognizing Ghostty; without a known name they assume an
+        // xterm with none of them.
+        cmd.env("TERM_PROGRAM", "ghostty");
         // PowerShell 7.6.6/7.6.7 crash on startup (in Windows Terminal too)
         // while printing the "new version available" banner under non-English
         // UI cultures such as zh-Hans and ja-JP: the localized message yields
@@ -136,6 +178,11 @@ impl Pty {
         let _ = self
             .master
             .resize(pty_size(cols, rows, cell_width, cell_height));
+    }
+
+    /// Where relative paths printed by the foreground program point.
+    pub fn foreground_cwd(&self) -> Option<PathBuf> {
+        self.master.foreground_cwd()
     }
 }
 

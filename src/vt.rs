@@ -498,6 +498,24 @@ impl Terminal {
         (result == GHOSTTY_SUCCESS).then_some(out)
     }
 
+    /// The OSC 8 hyperlink URI of a viewport cell, if it has one.
+    pub fn hyperlink_at(&self, x: u16, y: u16) -> Option<String> {
+        let grid_ref = self.viewport_ref(x, y)?;
+        let mut len = 0usize;
+        let result =
+            unsafe { ghostty_grid_ref_hyperlink_uri(&grid_ref, ptr::null_mut(), 0, &mut len) };
+        if result != GHOSTTY_OUT_OF_SPACE {
+            return None;
+        }
+        let mut uri = vec![0u8; len];
+        let result =
+            unsafe { ghostty_grid_ref_hyperlink_uri(&grid_ref, uri.as_mut_ptr(), len, &mut len) };
+        (result == GHOSTTY_SUCCESS && len > 0).then(|| {
+            uri.truncate(len);
+            String::from_utf8_lossy(&uri).into_owned()
+        })
+    }
+
     pub fn set_selection(&mut self, selection: Option<&GhosttySelection>) {
         let value = selection.map_or(ptr::null(), |s| s as *const _ as *const c_void);
         unsafe { ghostty_terminal_set(self.raw, GHOSTTY_TERMINAL_OPT_SELECTION, value) };
@@ -656,12 +674,17 @@ pub struct Cell {
     pub underline_color: Option<Rgb>,
     /// Wide character occupying this cell and the next.
     pub wide: bool,
+    /// Part of an OSC 8 hyperlink.
+    pub hyperlink: bool,
 }
 
 #[derive(Default)]
 pub struct Line {
     pub text: String,
+    /// One per column; spacers after wide characters have empty text.
     pub cells: Vec<Cell>,
+    /// Soft-wrapped: the text continues on the next line.
+    pub wrapped: bool,
 }
 
 /// One frame worth of terminal state, reused across frames to avoid
@@ -933,6 +956,23 @@ impl RenderState {
             let line = &mut frame.lines[row_index];
             line.text.clear();
             line.cells.clear();
+            let mut raw_row: GhosttyRow = Default::default();
+            line.wrapped = unsafe {
+                ghostty_render_state_row_get(
+                    self.rows,
+                    GHOSTTY_RENDER_STATE_ROW_DATA_RAW,
+                    &mut raw_row as *mut _ as *mut c_void,
+                ) == GHOSTTY_SUCCESS
+                    && {
+                        let mut wrapped = false;
+                        ghostty_row_get(
+                            raw_row,
+                            GHOSTTY_ROW_DATA_WRAP,
+                            &mut wrapped as *mut bool as *mut c_void,
+                        ) == GHOSTTY_SUCCESS
+                            && wrapped
+                    }
+            };
 
             let mut selection = sized!(GhosttyRenderStateRowSelection);
             let selected = unsafe {
@@ -961,6 +1001,13 @@ impl RenderState {
                     ghostty_cell_get(raw, GHOSTTY_CELL_DATA_WIDE, &mut wide as *mut _ as *mut c_void)
                 };
                 cell.wide = wide == GHOSTTY_CELL_WIDE_WIDE;
+                unsafe {
+                    ghostty_cell_get(
+                        raw,
+                        GHOSTTY_CELL_DATA_HAS_HYPERLINK,
+                        &mut cell.hyperlink as *mut bool as *mut c_void,
+                    )
+                };
                 let spacer =
                     wide == GHOSTTY_CELL_WIDE_SPACER_TAIL || wide == GHOSTTY_CELL_WIDE_SPACER_HEAD;
 

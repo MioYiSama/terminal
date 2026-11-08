@@ -4,10 +4,12 @@
 mod about;
 mod app_icon;
 mod box_drawing;
+mod clipboard;
 mod element;
 mod i18n;
 mod images;
 mod keys;
+mod links;
 mod menu_button;
 mod pty;
 mod settings;

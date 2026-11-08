@@ -2,6 +2,7 @@ use std::ffi::{CStr, OsStr, OsString};
 use std::fs::File;
 use std::io;
 use std::mem::MaybeUninit;
+use std::path::PathBuf;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::process::CommandExt;
@@ -52,6 +53,43 @@ impl Master {
         cvt(unsafe { libc::ioctl(self.fd.as_raw_fd(), libc::TIOCSWINSZ as _, &ws) })?;
         Ok(())
     }
+
+    pub fn foreground_cwd(&self) -> Option<PathBuf> {
+        // The foreground process group's id is its leader's pid.
+        let leader = unsafe { libc::tcgetpgrp(self.fd.as_raw_fd()) };
+        if leader <= 0 {
+            return None;
+        }
+        process_cwd(leader)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn process_cwd(pid: libc::pid_t) -> Option<PathBuf> {
+    let mut info = MaybeUninit::<libc::proc_vnodepathinfo>::zeroed();
+    let size = size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
+    let written = unsafe {
+        libc::proc_pidinfo(pid, libc::PROC_PIDVNODEPATHINFO, 0, info.as_mut_ptr().cast(), size)
+    };
+    if written != size {
+        return None;
+    }
+    let info = unsafe { info.assume_init() };
+    // `vip_path` is a NUL-terminated `[c_char; MAXPATHLEN]`.
+    let path = info.pvi_cdir.vip_path.as_flattened();
+    let path = unsafe { std::slice::from_raw_parts(path.as_ptr().cast::<u8>(), path.len()) };
+    let path = CStr::from_bytes_until_nul(path).ok()?;
+    Some(PathBuf::from(OsStr::from_bytes(path.to_bytes())))
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn process_cwd(pid: libc::pid_t) -> Option<PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
+fn process_cwd(_pid: libc::pid_t) -> Option<PathBuf> {
+    None
 }
 
 pub fn spawn(cmd: &Command, size: PtySize) -> io::Result<(Master, Child)> {
@@ -106,6 +144,9 @@ fn spawn_child(cmd: &Command, slave: File) -> io::Result<process::Child> {
             command
         }
     };
+    for key in &cmd.env_remove {
+        command.env_remove(key);
+    }
     command
         .args(&cmd.args)
         .envs(cmd.env.iter().map(|(k, v)| (k, v)))

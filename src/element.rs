@@ -10,11 +10,12 @@ use std::sync::Arc;
 use gpui::{
     App, BorderStyle, Bounds, ContentMask, Corners, CursorStyle, Element, RenderImage, ElementId, Entity, Focusable,
     GlobalElementId, Hitbox, HitboxBehavior, Hsla, InspectorElementId, IntoElement, LayoutId,
-    MouseMoveEvent, PaintQuad, Pixels, Point, Rgba, ShapedLine, SharedString, Style, TextRun,
+    MouseExitEvent, MouseMoveEvent, PaintQuad, Pixels, Point, Rgba, ShapedLine, SharedString, Style, TextRun,
     UnderlineStyle, Window, DispatchPhase, fill, outline, point, px, relative, size,
 };
 
 use crate::box_drawing;
+use crate::links::Link;
 use crate::view::{GridLayout, PADDING, SCROLLBAR_WIDTH, TerminalInputHandler, TerminalView};
 use crate::vt::{CursorShape, Frame, ImageLayer, ImagePlacement, Rgb, Underline};
 
@@ -78,6 +79,87 @@ pub struct Prepared {
     scrollbar: Option<(PaintQuad, Hitbox)>,
     /// Kitty graphics, sorted by layer and then z-index.
     images: Vec<ImageDraw>,
+    /// Offset and thickness of underlines within a row.
+    underline_y: Pixels,
+    thickness: Pixels,
+    link: Option<LinkDraw>,
+}
+
+/// The hovered link: underlined, with its URL shown in a corner and, when a
+/// click would open it, a pointing-hand cursor.
+struct LinkDraw {
+    underlines: Vec<PaintQuad>,
+    preview: (Point<Pixels>, ShapedLine, PaintQuad),
+    hitbox: Option<Hitbox>,
+}
+
+fn link_draw(
+    link: &Link,
+    clickable: bool,
+    prepared: &Prepared,
+    fonts: &[gpui::Font; 4],
+    foreground: Hsla,
+    window: &mut Window,
+) -> LinkDraw {
+    let layout = prepared.layout;
+    let origin = layout.bounds.origin + point(PADDING, PADDING);
+    let (cw, lh) = (layout.cell_width, layout.line_height);
+    let underlines = link
+        .spans
+        .iter()
+        .map(|(row, cols)| {
+            let top = origin.y + lh * *row as f32 + prepared.underline_y;
+            fill(
+                Bounds::new(
+                    point(origin.x + cw * cols.start as f32, top),
+                    size(cw * cols.len() as f32, prepared.thickness),
+                ),
+                foreground,
+            )
+        })
+        .collect();
+
+    // Long URLs are cut to the grid width.
+    let max_chars = (layout.cols as usize).saturating_sub(2).max(1);
+    let text: SharedString = if link.url.chars().count() > max_chars {
+        let mut cut: String = link.url.chars().take(max_chars - 1).collect();
+        cut.push('…');
+        cut.into()
+    } else {
+        link.url.clone().into()
+    };
+    let run = TextRun {
+        len: text.len(),
+        font: fonts[0].clone(),
+        color: prepared.background,
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let line = window
+        .text_system()
+        .shape_line(text, prepared.font_size, &[run], None);
+    let pad = cw / 2.;
+    let chip = size(line.width + pad * 2., lh);
+    // Bottom-left, or bottom-right when that would cover the link itself.
+    let bottom = layout.bounds.bottom() - PADDING - chip.height;
+    let left = layout.bounds.left() + PADDING;
+    let covers_link = link.spans.iter().any(|(row, cols)| {
+        *row + 1 >= layout.rows && origin.x + cw * cols.start as f32 <= left + chip.width
+    });
+    let x = if covers_link {
+        layout.bounds.right() - PADDING - SCROLLBAR_WIDTH - chip.width
+    } else {
+        left
+    };
+    let chip_bounds = Bounds::new(point(x, bottom), chip);
+    let background = fill(chip_bounds, foreground.opacity(0.9)).corner_radii(px(4.));
+    let hitbox = clickable.then(|| window.insert_hitbox(layout.bounds, HitboxBehavior::Normal));
+    LinkDraw {
+        underlines,
+        preview: (point(x + pad, bottom), line, background),
+        hitbox,
+    }
 }
 
 struct ImageDraw {
@@ -248,6 +330,10 @@ impl Element for TerminalElement {
                 window,
             );
             prepared.images = image_draws(layout, view.images(window));
+            let clickable = view.link_clickable();
+            prepared.link = view
+                .hovered_link()
+                .map(|link| link_draw(link, clickable, &prepared, &fonts, foreground, window));
             prepared.scrollbar = view.scrollbar_thumb().map(|(slot, highlighted)| {
                 let thumb = Bounds::new(
                     point(
@@ -288,6 +374,12 @@ impl Element for TerminalElement {
         window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
             if phase == DispatchPhase::Bubble {
                 view.update(cx, |view, cx| view.mouse_move(event, window, cx));
+            }
+        });
+        let view = self.view.clone();
+        window.on_mouse_event(move |_: &MouseExitEvent, phase, _, cx| {
+            if phase == DispatchPhase::Bubble {
+                view.update(cx, |view, cx| view.mouse_exit(cx));
             }
         });
 
@@ -379,6 +471,17 @@ impl Element for TerminalElement {
                 window.paint_quad(background);
                 let _ = line.paint(position, layout.line_height, window, cx);
             }
+            if let Some(link) = prepared.link.take() {
+                for quad in link.underlines {
+                    window.paint_quad(quad);
+                }
+                let (position, line, background) = link.preview;
+                window.paint_quad(background);
+                let _ = line.paint(position, layout.line_height, window, cx);
+                if let Some(hitbox) = &link.hitbox {
+                    window.set_cursor_style(CursorStyle::PointingHand, hitbox);
+                }
+            }
             if let Some((thumb, hitbox)) = prepared.scrollbar.take() {
                 window.paint_quad(thumb);
                 window.set_cursor_style(CursorStyle::Arrow, &hitbox);
@@ -465,6 +568,8 @@ fn build(
                 ));
             };
             match cell.underline {
+                // OSC 8 hyperlinks are underlined unless styled otherwise.
+                Underline::None if cell.hyperlink => line_at(underline_y, deco_color),
                 Underline::None => {}
                 Underline::Double => {
                     line_at(underline_y, deco_color);
@@ -592,6 +697,9 @@ fn build(
         marked,
         scrollbar: None,
         images: Vec::new(),
+        underline_y,
+        thickness,
+        link: None,
     }
 }
 

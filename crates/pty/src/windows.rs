@@ -71,6 +71,11 @@ impl Master {
         unsafe { ResizePseudoConsole(self.console, coord(size))? };
         Ok(())
     }
+
+    /// ConPTY does not say which process is in the foreground.
+    pub fn foreground_cwd(&self) -> Option<PathBuf> {
+        None
+    }
 }
 
 impl Drop for Master {
@@ -257,10 +262,12 @@ fn push_quoted(line: &mut Vec<u16>, arg: &OsStr) {
     line.push(QUOTE);
 }
 
-/// The current environment with `cmd.env` applied, as a sorted UTF-16 block.
-/// Variable names are case-insensitive on Windows.
+/// The current environment with `cmd.env_remove` and `cmd.env` applied, as a
+/// sorted UTF-16 block. Variable names are case-insensitive on Windows.
 fn environment_block(cmd: &Command) -> Vec<u16> {
-    let mut vars: Vec<(OsString, OsString)> = env::vars_os().collect();
+    let mut vars: Vec<(OsString, OsString)> = env::vars_os()
+        .filter(|(name, _)| !cmd.env_remove.iter().any(|key| name.eq_ignore_ascii_case(key)))
+        .collect();
     for (key, value) in &cmd.env {
         match vars
             .iter_mut()
