@@ -12,11 +12,6 @@ ghostty-sys = { version = "0.1.0", path = "crates/ghostty-sys" }
 gpui = "0.2.2"
 pty = { version = "0.1.0", path = "crates/pty" }
 
-# gpui 0.2.2 pulls in xattr 0.2.3 (via gpui_http_client → zed-async-tar), which
-# uses `libc::ENOATTR`; libc 0.2.190 removed that constant on Linux.
-[target.'cfg(target_os = "linux")'.dependencies]
-libc = "=0.2.189"
-
 [profile.release]
 opt-level = "z"
 lto = "fat"

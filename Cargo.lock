@@ -5385,7 +5385,6 @@ dependencies = [
  "futures",
  "ghostty-sys",
  "gpui",
- "libc",
  "pty",
 ]
 

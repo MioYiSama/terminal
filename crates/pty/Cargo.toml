@@ -6,7 +6,10 @@ description = "Minimal pseudo terminal: Unix openpty(3) and Windows ConPTY"
 license = "MIT"
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+# Pinned for the whole build: gpui 0.2.2 pulls in xattr 0.2.3 (via
+# gpui_http_client → zed-async-tar), which uses `libc::ENOATTR`; libc 0.2.190
+# removed that constant on Linux.
+libc = "=0.2.189"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [
