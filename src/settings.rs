@@ -1,14 +1,14 @@
 //! User settings, kept as a GPUI global. Loaded from
-//! `<config_dir>/terminal/settings.json` at startup and saved on every change.
+//! `<config_dir>/terminal/settings.json` at startup and saved in the
+//! background on every change.
 
 use std::fs;
 use std::path::PathBuf;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use catppuccin::{Flavor, FlavorName, Palette};
 use gpui::{App, Global, Pixels, WindowAppearance, px};
 use serde::{Deserialize, Serialize};
-
-use crate::i18n::Language;
 
 pub const MIN_FONT_SIZE: f32 = 6.;
 pub const MAX_FONT_SIZE: f32 = 72.;
@@ -32,6 +32,33 @@ const FONT_CANDIDATES: &[&str] = if cfg!(target_os = "macos") {
 
 /// A `static` copy of the palette so flavors can be borrowed for `'static`.
 static PALETTE: Palette = catppuccin::PALETTE;
+
+/// UI language; `i18n` translates into it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Language {
+    /// Follow the system's preferred language.
+    #[default]
+    #[serde(rename = "system")]
+    System,
+    #[serde(rename = "en-US")]
+    English,
+    #[serde(rename = "zh-CN")]
+    SimplifiedChinese,
+}
+
+impl Language {
+    pub const ALL: [Self; 3] = [Self::System, Self::English, Self::SimplifiedChinese];
+
+    /// The language's name in itself, as shown in the language picker.
+    /// `None` for [`Language::System`], whose label is translated.
+    pub fn native_name(self) -> Option<&'static str> {
+        match self {
+            Self::System => None,
+            Self::English => Some("English"),
+            Self::SimplifiedChinese => Some("简体中文"),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -109,6 +136,12 @@ impl Settings {
             settings.font_family = default_font_family(cx);
         }
         cx.set_global(settings);
+        // Write a save still queued when the app quits.
+        cx.on_app_quit(|_| {
+            flush();
+            async {}
+        })
+        .detach();
     }
 
     pub fn get(cx: &App) -> &Self {
@@ -124,7 +157,7 @@ impl Settings {
         if settings == *Self::get(cx) {
             return;
         }
-        save(&settings);
+        queue_save(settings.clone(), cx);
         cx.set_global(settings);
     }
 
@@ -190,6 +223,31 @@ fn load() -> Option<Settings> {
     serde_json::from_str(&text)
         .inspect_err(|err| eprintln!("invalid settings in {}: {err}", path.display()))
         .ok()
+}
+
+/// Settings waiting to be written. Only the latest matters.
+static PENDING_SAVE: Mutex<Option<Settings>> = Mutex::new(None);
+/// Held while writing, so writes never interleave.
+static WRITING: Mutex<()> = Mutex::new(());
+
+/// Save off the UI thread. Every queued save is followed by a flush, so
+/// the last settings queued are the last written.
+fn queue_save(settings: Settings, cx: &App) {
+    *lock(&PENDING_SAVE) = Some(settings);
+    cx.background_executor().spawn(async { flush() }).detach();
+}
+
+/// Write the latest queued settings, if a flush has not already.
+fn flush() {
+    let _writing = lock(&WRITING);
+    let pending = lock(&PENDING_SAVE).take();
+    if let Some(settings) = pending {
+        save(&settings);
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 fn save(settings: &Settings) {

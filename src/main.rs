@@ -187,9 +187,9 @@ fn main() {
         });
         cx.on_action(|_: &Quit, cx| cx.quit());
         set_menus(cx);
-        let mut language = Settings::get(cx).language.resolve();
+        let mut language = i18n::current(cx);
         cx.observe_global::<Settings>(move |cx| {
-            let current = Settings::get(cx).language.resolve();
+            let current = i18n::current(cx);
             if current != language {
                 language = current;
                 set_menus(cx);

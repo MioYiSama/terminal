@@ -6,9 +6,8 @@ use std::sync::LazyLock;
 use fluent_bundle::concurrent::FluentBundle;
 use fluent_bundle::{FluentArgs, FluentResource};
 use gpui::{App, SharedString};
-use serde::{Deserialize, Serialize};
 
-use crate::settings::Settings;
+use crate::settings::{Language, Settings};
 
 type Bundle = FluentBundle<FluentResource>;
 
@@ -35,67 +34,38 @@ static SYSTEM_LANGUAGE: LazyLock<Language> = LazyLock::new(|| {
     }
 });
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Language {
-    /// Follow the system's preferred language.
-    #[default]
-    #[serde(rename = "system")]
-    System,
-    #[serde(rename = "en-US")]
-    English,
-    #[serde(rename = "zh-CN")]
-    SimplifiedChinese,
-}
-
-impl Language {
-    pub const ALL: [Self; 3] = [Self::System, Self::English, Self::SimplifiedChinese];
-
-    /// The language's name in itself, as shown in the language picker.
-    /// `None` for [`Language::System`], whose label is translated.
-    pub fn native_name(self) -> Option<&'static str> {
-        match self {
-            Self::System => None,
-            Self::English => Some("English"),
-            Self::SimplifiedChinese => Some("简体中文"),
-        }
-    }
-
-    /// The concrete language this setting resolves to.
-    pub fn resolve(self) -> Self {
-        match self {
-            Self::System => *SYSTEM_LANGUAGE,
-            language => language,
-        }
-    }
-
-    fn bundle(self) -> &'static Bundle {
-        match self.resolve() {
-            Self::SimplifiedChinese => &ZH_CN,
-            Self::English | Self::System => &EN_US,
-        }
-    }
-
-    /// Format message `id`, falling back to English and then to the id
-    /// itself when it is missing.
-    pub fn tr(self, id: &str, args: Option<&FluentArgs>) -> SharedString {
-        format(self.bundle(), id, args)
-            .or_else(|| format(&EN_US, id, args))
-            .unwrap_or_else(|| {
-                eprintln!("missing translation: {id}");
-                id.to_owned()
-            })
-            .into()
+/// The concrete language the settings select: never [`Language::System`].
+pub fn current(cx: &App) -> Language {
+    match Settings::get(cx).language {
+        Language::System => *SYSTEM_LANGUAGE,
+        language => language,
     }
 }
 
 /// Message `id` in the current language.
 pub fn tr(cx: &App, id: &str) -> SharedString {
-    Settings::get(cx).language.tr(id, None)
+    translate(current(cx), id, None)
 }
 
 /// Message `id` in the current language, with Fluent variables.
 pub fn tr_args(cx: &App, id: &str, args: &FluentArgs) -> SharedString {
-    Settings::get(cx).language.tr(id, Some(args))
+    translate(current(cx), id, Some(args))
+}
+
+/// Format message `id`, falling back to English and then to the id itself
+/// when it is missing.
+fn translate(language: Language, id: &str, args: Option<&FluentArgs>) -> SharedString {
+    let bundle: &Bundle = match language {
+        Language::SimplifiedChinese => &ZH_CN,
+        Language::English | Language::System => &EN_US,
+    };
+    format(bundle, id, args)
+        .or_else(|| format(&EN_US, id, args))
+        .unwrap_or_else(|| {
+            eprintln!("missing translation: {id}");
+            id.to_owned()
+        })
+        .into()
 }
 
 fn format(bundle: &Bundle, id: &str, args: Option<&FluentArgs>) -> Option<String> {

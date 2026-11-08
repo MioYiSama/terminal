@@ -8,8 +8,8 @@ use gpui::{
 };
 
 use crate::font_picker::FontPicker;
-use crate::i18n::{Language, tr};
-use crate::settings::{MAX_FONT_SIZE, MIN_FONT_SIZE, Settings, ThemeMode, WindowsShell};
+use crate::i18n::tr;
+use crate::settings::{Language, MAX_FONT_SIZE, MIN_FONT_SIZE, Settings, ThemeMode, WindowsShell};
 use crate::theme::{UiColors, hsla};
 
 const FLAVORS: [FlavorName; 4] = [
