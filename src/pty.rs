@@ -38,18 +38,27 @@ fn home_dir() -> Option<PathBuf> {
 }
 
 impl Pty {
-    /// Spawn the user's default shell. Output and exit notifications arrive
-    /// on the returned channel.
+    /// Spawn `program`, or the user's default shell if `None`. Output and
+    /// exit notifications arrive on the returned channel.
     pub fn spawn(
+        program: Option<&str>,
         cols: u16,
         rows: u16,
         cell_width: u16,
         cell_height: u16,
     ) -> Result<(Self, UnboundedReceiver<PtyEvent>), String> {
-        let mut cmd = Command::default_shell();
+        let mut cmd = program.map_or_else(Command::default_shell, Command::new);
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
         cmd.env("TERM_PROGRAM", env!("CARGO_PKG_NAME"));
+        // PowerShell 7.6.6/7.6.7 crash on startup (in Windows Terminal too)
+        // while printing the "new version available" banner under non-English
+        // UI cultures such as zh-Hans and ja-JP: the localized message yields
+        // a negative `PadRight` width (PowerShell/PowerShell#28131). Skip the
+        // update check unless the user configured it.
+        if cfg!(windows) && std::env::var_os("POWERSHELL_UPDATECHECK").is_none() {
+            cmd.env("POWERSHELL_UPDATECHECK", "Off");
+        }
         if let Some(home) = home_dir() {
             cmd.cwd(home);
         }

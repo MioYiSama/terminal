@@ -9,7 +9,7 @@ use gpui::{
 };
 
 use crate::i18n::{Language, tr};
-use crate::settings::{MAX_FONT_SIZE, MIN_FONT_SIZE, Settings, ThemeMode};
+use crate::settings::{MAX_FONT_SIZE, MIN_FONT_SIZE, Settings, ThemeMode, WindowsShell};
 use crate::text_input::{Changed, TextInput};
 use crate::theme::{UiColors, hsla};
 
@@ -341,6 +341,22 @@ impl Render for SettingsView {
                 .child(label)
         }));
 
+        let shells = div().flex().flex_col().gap_2().child(
+            div().flex().gap_2().children(WindowsShell::ALL.map(|shell| {
+                let label = shell
+                    .program()
+                    .map_or_else(|| tr(cx, "settings-shell-auto"), |program| {
+                        program.trim_end_matches(".exe").into()
+                    });
+                choice(("shell", shell as usize), settings.windows_shell == shell, colors)
+                    .on_click(move |_, _, cx| {
+                        Settings::update(cx, |settings| settings.windows_shell = shell)
+                    })
+                    .child(label)
+            })),
+        )
+        .child(div().text_xs().text_color(colors.muted).child(tr(cx, "settings-shell-hint")));
+
         let theme_modes = div().flex().gap_2().children(THEME_MODES.map(|(mode, label)| {
             choice(("theme-mode", mode as usize), settings.theme_mode == mode, colors)
                 .on_click(move |_, _, cx| Settings::update(cx, |settings| settings.theme_mode = mode))
@@ -414,7 +430,10 @@ impl Render for SettingsView {
             .text_sm()
             .child(
                 section(tr(cx, "settings-general"), colors)
-                    .child(row(tr(cx, "settings-language"), languages)),
+                    .child(row(tr(cx, "settings-language"), languages))
+                    .when(cfg!(windows), |section| {
+                        section.child(row(tr(cx, "settings-shell"), shells))
+                    }),
             )
             .child(
                 section(tr(cx, "settings-appearance"), colors)

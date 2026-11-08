@@ -45,6 +45,28 @@ pub struct TerminalColors {
     pub palette: [Rgb; 256],
 }
 
+/// Where the viewport sits in the scrollable area (scrollback plus active
+/// screen), in rows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Scrollbar {
+    pub total: u64,
+    /// First visible row.
+    pub offset: u64,
+    /// Visible rows.
+    pub len: u64,
+}
+
+impl Scrollbar {
+    pub fn scrollable(&self) -> bool {
+        self.total > self.len
+    }
+
+    /// Offset of the viewport when scrolled to the bottom.
+    pub fn max_offset(&self) -> u64 {
+        self.total.saturating_sub(self.len)
+    }
+}
+
 /// Side effects the VT stream produced during the last write. Shared with
 /// the C callbacks through the terminal's userdata pointer.
 #[derive(Default)]
@@ -241,6 +263,25 @@ impl Terminal {
             value: GhosttyTerminalScrollViewportValue { delta },
         };
         unsafe { ghostty_terminal_scroll_viewport(self.raw, scroll) };
+    }
+
+    /// Scroll so that scrollback row `row` (same row space as
+    /// [`Scrollbar::offset`]) is the first visible row.
+    pub fn scroll_to_row(&mut self, row: u64) {
+        let scroll = GhosttyTerminalScrollViewport {
+            tag: GHOSTTY_TERMINAL_SCROLL_VIEWPORT_ROW,
+            value: GhosttyTerminalScrollViewportValue { row: row as usize },
+        };
+        unsafe { ghostty_terminal_scroll_viewport(self.raw, scroll) };
+    }
+
+    pub fn scrollbar(&self) -> Scrollbar {
+        self.get::<GhosttyTerminalScrollbar>(GHOSTTY_TERMINAL_DATA_SCROLLBAR)
+            .map_or(Scrollbar::default(), |bar| Scrollbar {
+                total: bar.total,
+                offset: bar.offset,
+                len: bar.len,
+            })
     }
 
     pub fn scroll_to_bottom(&mut self) {

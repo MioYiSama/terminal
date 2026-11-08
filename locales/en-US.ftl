@@ -1,6 +1,8 @@
 menu-about = About Terminal
 menu-settings = Settings…
 menu-new-window = New Window
+menu-new-tab = New Tab
+menu-close-tab = Close Tab
 menu-quit = Quit
 
 about-title = About Terminal
@@ -10,6 +12,9 @@ about-description = A terminal emulator built on GPUI and libghostty-vt.
 settings-title = Settings
 settings-general = General
 settings-language = Language
+settings-shell = Shell
+settings-shell-auto = Auto
+settings-shell-hint = Applies to new tabs. Auto uses the first one found of pwsh, powershell and cmd.
 settings-appearance = Appearance
 settings-theme = Theme
 settings-system = System

@@ -1,6 +1,8 @@
 menu-about = 关于 Terminal
 menu-settings = 设置…
 menu-new-window = 新建窗口
+menu-new-tab = 新建标签页
+menu-close-tab = 关闭标签页
 menu-quit = 退出
 
 about-title = 关于 Terminal
@@ -10,6 +12,9 @@ about-description = 基于 GPUI 和 libghostty-vt 构建的终端模拟器。
 settings-title = 设置
 settings-general = 通用
 settings-language = 语言
+settings-shell = Shell
+settings-shell-auto = 自动
+settings-shell-hint = 对新标签页生效。自动会依次检测 pwsh、powershell、cmd，使用第一个找到的。
 settings-appearance = 外观
 settings-theme = 主题
 settings-system = 跟随系统

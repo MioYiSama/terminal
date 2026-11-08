@@ -7,21 +7,20 @@ use std::time::Instant;
 use futures::StreamExt;
 use ghostty_sys::*;
 use gpui::{
-    App, Bounds, ClipboardItem, Context, CursorStyle, Entity, EntityInputHandler, FocusHandle, Focusable,
+    App, Bounds, ClipboardItem, Context, CursorStyle, EntityInputHandler, EventEmitter, FocusHandle, Focusable,
     Font, KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    Pixels, Point, PromptLevel, Render, ScrollDelta, ScrollWheelEvent, Subscription, Task,
-    UTF16Selection, Window, actions, div, font, point, prelude::*, px, size,
+    Pixels, Point, PromptLevel, Render, ScrollDelta, ScrollWheelEvent, SharedString, Subscription,
+    Task, UTF16Selection, Window, actions, div, font, point, prelude::*, px, size,
 };
 
 use crate::element::TerminalElement;
 use crate::keys;
-use crate::menu_bar::{self, MenuBar};
 use crate::pty::{Pty, PtyEvent};
 use crate::settings::{MAX_FONT_SIZE, MIN_FONT_SIZE, Settings};
 use crate::theme;
 use crate::vt::{
-    self, Frame, GesturePoint, KeyEncoder, KeyInput, MouseEncoder, RenderState, SelectionGesture,
-    SurfaceSize, Terminal,
+    self, Frame, GesturePoint, KeyEncoder, KeyInput, MouseEncoder, RenderState, Scrollbar,
+    SelectionGesture, SurfaceSize, Terminal,
 };
 
 actions!(
@@ -38,6 +37,9 @@ actions!(
 
 pub const KEY_CONTEXT: &str = "Terminal";
 pub const PADDING: Pixels = px(6.);
+/// Width reserved for the scrollbar right of the grid's padding.
+pub const SCROLLBAR_WIDTH: Pixels = px(10.);
+const MIN_THUMB_HEIGHT: Pixels = px(24.);
 const MODE_FOCUS_EVENT: u16 = 1004;
 const MODE_ALTERNATE_SCROLL: u16 = 1007;
 
@@ -73,15 +75,61 @@ impl GridLayout {
         (f32::from(local.x), f32::from(local.y))
     }
 
+    /// The scrollbar's gutter along the element's right edge.
+    pub fn scrollbar_track(&self) -> Bounds<Pixels> {
+        Bounds::new(
+            point(self.bounds.right() - SCROLLBAR_WIDTH, self.bounds.top()),
+            size(SCROLLBAR_WIDTH, self.bounds.size.height),
+        )
+    }
+
+    /// The thumb's slot in the track (full gutter width), or `None` when
+    /// there is nothing to scroll.
+    pub fn scrollbar_thumb(&self, bar: Scrollbar) -> Option<Bounds<Pixels>> {
+        if !bar.scrollable() {
+            return None;
+        }
+        let track = self.scrollbar_track();
+        let height = track.size.height;
+        let thumb = (height * (bar.len as f32 / bar.total as f32))
+            .max(MIN_THUMB_HEIGHT)
+            .min(height);
+        let top = (height - thumb) * (bar.offset as f32 / bar.max_offset() as f32);
+        Some(Bounds::new(
+            point(track.left(), track.top() + top),
+            size(track.size.width, thumb),
+        ))
+    }
+
+    /// The scroll offset that puts the thumb's top edge at window-space `y`.
+    fn scrollbar_offset_at(&self, bar: Scrollbar, y: Pixels) -> u64 {
+        let Some(thumb) = self.scrollbar_thumb(bar) else {
+            return 0;
+        };
+        let track = self.scrollbar_track();
+        let range = f32::from(track.size.height - thumb.size.height);
+        if range <= 0. {
+            return 0;
+        }
+        let fraction = (f32::from(y - track.top()) / range).clamp(0., 1.);
+        (fraction * bar.max_offset() as f32).round() as u64
+    }
+
     fn surface_size(&self) -> SurfaceSize {
         SurfaceSize {
-            width: f32::from(self.bounds.size.width) as u32,
+            width: f32::from(self.bounds.size.width - SCROLLBAR_WIDTH) as u32,
             height: f32::from(self.bounds.size.height) as u32,
             cell_width: f32::from(self.cell_width) as u32,
             cell_height: f32::from(self.line_height) as u32,
             padding: f32::from(PADDING) as u32,
         }
     }
+}
+
+pub enum TerminalEvent {
+    TitleChanged,
+    /// The shell exited.
+    Exited,
 }
 
 pub struct TerminalView {
@@ -106,8 +154,15 @@ pub struct TerminalView {
     /// Button currently reported to the program via mouse tracking.
     reported_button: Option<GhosttyMouseButton>,
     selecting: bool,
+    /// Scroll position as of the last frame.
+    scrollbar: Scrollbar,
+    /// While dragging the scrollbar thumb: the pointer's distance from the
+    /// thumb's top edge.
+    scrollbar_drag: Option<Pixels>,
+    scrollbar_hovered: bool,
+    /// Title set by the program (OSC 0/2); empty if none.
+    title: SharedString,
     epoch: Instant,
-    menu_bar: Option<Entity<MenuBar>>,
     _subscriptions: Vec<Subscription>,
     _io: Task<()>,
 }
@@ -122,7 +177,7 @@ impl TerminalView {
         terminal.set_colors(&theme::terminal_colors(settings.flavor(window.appearance())));
         let gesture = SelectionGesture::new(&terminal);
 
-        let (pty, events) = match Pty::spawn(cols, rows, 8, 16) {
+        let (pty, events) = match Pty::spawn(settings.shell(), cols, rows, 8, 16) {
             Ok((pty, events)) => (Some(pty), Some(events)),
             Err(err) => {
                 terminal.vt_write(format!("\x1b[31mfailed to start shell: {err}\x1b[0m\r\n").as_bytes());
@@ -131,7 +186,7 @@ impl TerminalView {
         };
 
         let io = match events {
-            Some(mut events) => cx.spawn_in(window, async move |this, cx| {
+            Some(mut events) => cx.spawn(async move |this, cx| {
                 while let Some(event) = events.next().await {
                     let mut exited = matches!(event, PtyEvent::Exited);
                     let mut output = match event {
@@ -145,12 +200,12 @@ impl TerminalView {
                             PtyEvent::Exited => exited = true,
                         }
                     }
-                    let updated = this.update_in(cx, |view, window, cx| {
+                    let updated = this.update(cx, |view, cx| {
                         if !output.is_empty() {
-                            view.process_output(&output, window, cx);
+                            view.process_output(&output, cx);
                         }
                         if exited {
-                            window.remove_window();
+                            cx.emit(TerminalEvent::Exited);
                         }
                     });
                     if updated.is_err() || exited {
@@ -187,8 +242,11 @@ impl TerminalView {
             scroll_remainder: 0.,
             reported_button: None,
             selecting: false,
+            scrollbar: Scrollbar::default(),
+            scrollbar_drag: None,
+            scrollbar_hovered: false,
+            title: SharedString::default(),
             epoch: Instant::now(),
-            menu_bar: menu_bar::ENABLED.then(|| cx.new(|_| MenuBar::default())),
             _subscriptions: subscriptions,
             _io: io,
         }
@@ -208,6 +266,22 @@ impl TerminalView {
 
     pub fn is_focused(&self, window: &Window) -> bool {
         self.focus_handle.is_focused(window)
+    }
+
+    pub fn focus(&self, window: &mut Window) {
+        self.focus_handle.focus(window);
+    }
+
+    /// Title set by the program, or empty.
+    pub fn title(&self) -> &SharedString {
+        &self.title
+    }
+
+    /// The scrollbar thumb's slot as of the last frame, and whether it is
+    /// highlighted (hovered or dragged).
+    pub fn scrollbar_thumb(&self) -> Option<(Bounds<Pixels>, bool)> {
+        let thumb = self.layout?.scrollbar_thumb(self.scrollbar)?;
+        Some((thumb, self.scrollbar_hovered || self.scrollbar_drag.is_some()))
     }
 
     /// Apply the grid size the element computed, resizing the terminal and
@@ -234,6 +308,7 @@ impl TerminalView {
     /// Refresh and return the frame to draw.
     pub fn snapshot(&mut self) -> &Frame {
         self.render_state.snapshot(&self.terminal, &mut self.frame);
+        self.scrollbar = self.terminal.scrollbar();
         &self.frame
     }
 
@@ -255,11 +330,12 @@ impl TerminalView {
         cx.notify();
     }
 
-    fn process_output(&mut self, bytes: &[u8], window: &mut Window, cx: &mut Context<Self>) {
+    fn process_output(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
         self.terminal.vt_write(bytes);
         self.flush_replies();
         if let Some(title) = self.terminal.take_title_change() {
-            window.set_window_title(if title.is_empty() { "Terminal" } else { &title });
+            self.title = title.into();
+            cx.emit(TerminalEvent::TitleChanged);
         }
         cx.notify();
     }
@@ -436,8 +512,37 @@ impl TerminalView {
         })
     }
 
+    /// Start a thumb drag if the press hit the scrollbar. Pressing the track
+    /// outside the thumb jumps there and keeps dragging from the thumb's
+    /// center.
+    fn scrollbar_press(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) -> bool {
+        let Some(layout) = self.layout else { return false };
+        let Some(thumb) = layout.scrollbar_thumb(self.scrollbar) else {
+            return false;
+        };
+        if event.button != MouseButton::Left
+            || !layout.scrollbar_track().contains(&event.position)
+        {
+            return false;
+        }
+        let grab = if thumb.contains(&event.position) {
+            event.position.y - thumb.top()
+        } else {
+            let grab = thumb.size.height / 2.;
+            let offset = layout.scrollbar_offset_at(self.scrollbar, event.position.y - grab);
+            self.terminal.scroll_to_row(offset);
+            grab
+        };
+        self.scrollbar_drag = Some(grab);
+        cx.notify();
+        true
+    }
+
     fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.focus_handle.focus(window);
+        if self.scrollbar_press(event, cx) {
+            return;
+        }
         if self.reports_mouse(event.modifiers.shift) {
             let button = ghostty_button(event.button);
             self.reported_button = Some(button);
@@ -467,11 +572,21 @@ impl TerminalView {
     /// Registered window-wide by the element so drags keep working when the
     /// pointer leaves the terminal.
     pub fn mouse_move(&mut self, event: &MouseMoveEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(layout) = self.layout else { return };
+        if let Some(grab) = self.scrollbar_drag {
+            let offset = layout.scrollbar_offset_at(self.scrollbar, event.position.y - grab);
+            self.terminal.scroll_to_row(offset);
+            cx.notify();
+            return;
+        }
+        let hovered = self.scrollbar.scrollable()
+            && layout.scrollbar_track().contains(&event.position);
+        if hovered != self.scrollbar_hovered {
+            self.scrollbar_hovered = hovered;
+            cx.notify();
+        }
         if self.reports_mouse(event.modifiers.shift) {
-            let in_grid = self
-                .layout
-                .is_some_and(|layout| layout.bounds.contains(&event.position));
-            if in_grid || self.reported_button.is_some() {
+            if layout.bounds.contains(&event.position) || self.reported_button.is_some() {
                 self.report_mouse(
                     GHOSTTY_MOUSE_ACTION_MOTION,
                     self.reported_button,
@@ -484,7 +599,7 @@ impl TerminalView {
         if !self.selecting || event.pressed_button != Some(MouseButton::Left) {
             return;
         }
-        let (Some(layout), Some(point)) = (self.layout, self.gesture_point(event.position)) else {
+        let Some(point) = self.gesture_point(event.position) else {
             return;
         };
         let geometry = GhosttySelectionGestureGeometry {
@@ -502,6 +617,10 @@ impl TerminalView {
     }
 
     fn mouse_up(&mut self, event: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if event.button == MouseButton::Left && self.scrollbar_drag.take().is_some() {
+            cx.notify();
+            return;
+        }
         if let Some(button) = self.reported_button.take() {
             self.report_mouse(
                 GHOSTTY_MOUSE_ACTION_RELEASE,
@@ -699,6 +818,8 @@ impl EntityInputHandler for TerminalView {
     }
 }
 
+impl EventEmitter<TerminalEvent> for TerminalView {}
+
 impl Focusable for TerminalView {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -707,12 +828,11 @@ impl Focusable for TerminalView {
 
 impl Render for TerminalView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let terminal = div()
+        div()
             .id("terminal")
             .key_context(KEY_CONTEXT)
             .track_focus(&self.focus_handle)
-            .flex_1()
-            .min_h_0()
+            .size_full()
             .cursor(CursorStyle::IBeam)
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::paste))
@@ -736,13 +856,7 @@ impl Render for TerminalView {
             .on_mouse_up(MouseButton::Middle, cx.listener(Self::mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::mouse_up))
             .on_scroll_wheel(cx.listener(Self::scroll_wheel))
-            .child(TerminalElement::new(cx.entity()));
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .children(self.menu_bar.clone())
-            .child(terminal)
+            .child(TerminalElement::new(cx.entity()))
     }
 }
 
@@ -826,5 +940,62 @@ impl gpui::InputHandler for TerminalInputHandler {
 
     fn apple_press_and_hold_enabled(&mut self) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn layout() -> GridLayout {
+        GridLayout {
+            bounds: Bounds::new(point(px(0.), px(40.)), size(px(800.), px(500.))),
+            cell_width: px(8.),
+            line_height: px(16.),
+            cols: 97,
+            rows: 30,
+        }
+    }
+
+    fn bar(offset: u64) -> Scrollbar {
+        Scrollbar {
+            total: 1000,
+            offset,
+            len: 30,
+        }
+    }
+
+    #[test]
+    fn thumb_spans_track_ends() {
+        let layout = layout();
+        let track = layout.scrollbar_track();
+        let top = layout.scrollbar_thumb(bar(0)).unwrap();
+        let bottom = layout.scrollbar_thumb(bar(970)).unwrap();
+        assert_eq!(top.top(), track.top());
+        assert_eq!(bottom.bottom(), track.bottom());
+        // 30 of 1000 rows would be 15px: clamped to the minimum.
+        assert_eq!(top.size.height, MIN_THUMB_HEIGHT);
+    }
+
+    #[test]
+    fn dragging_thumb_round_trips_offset() {
+        let layout = layout();
+        for offset in [0, 1, 485, 969, 970] {
+            let thumb = layout.scrollbar_thumb(bar(offset)).unwrap();
+            assert_eq!(layout.scrollbar_offset_at(bar(offset), thumb.top()), offset);
+        }
+        // Dragging past either end clamps.
+        assert_eq!(layout.scrollbar_offset_at(bar(500), px(-100.)), 0);
+        assert_eq!(layout.scrollbar_offset_at(bar(500), px(10_000.)), 970);
+    }
+
+    #[test]
+    fn no_thumb_without_scrollback() {
+        let screen = Scrollbar {
+            total: 30,
+            offset: 0,
+            len: 30,
+        };
+        assert!(layout().scrollbar_thumb(screen).is_none());
     }
 }

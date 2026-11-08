@@ -2,6 +2,8 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod about;
+mod app_icon;
+mod box_drawing;
 mod element;
 mod i18n;
 mod keys;
@@ -13,6 +15,7 @@ mod text_input;
 mod theme;
 mod view;
 mod vt;
+mod workspace;
 
 use gpui::{
     App, Application, Bounds, KeyBinding, Menu, MenuItem, Pixels, Render, Size, TitlebarOptions,
@@ -26,8 +29,8 @@ use settings_view::SettingsView;
 
 use view::{
     Copy, DecreaseFontSize, IncreaseFontSize, KEY_CONTEXT, Paste, ResetFontSize, SelectAll,
-    TerminalView,
 };
+use workspace::{CloseTab, NewTab, NextTab, PreviousTab, Workspace};
 
 actions!(app, [About, OpenSettings, NewWindow, Quit]);
 
@@ -46,6 +49,12 @@ fn bind_keys(cx: &mut App) {
             KeyBinding::new("cmd-0", ResetFontSize, ctx),
             KeyBinding::new("cmd-,", OpenSettings, None),
             KeyBinding::new("cmd-n", NewWindow, None),
+            KeyBinding::new("cmd-t", NewTab, None),
+            KeyBinding::new("cmd-w", CloseTab, None),
+            KeyBinding::new("cmd-}", NextTab, None),
+            KeyBinding::new("cmd-{", PreviousTab, None),
+            KeyBinding::new("ctrl-tab", NextTab, None),
+            KeyBinding::new("ctrl-shift-tab", PreviousTab, None),
             KeyBinding::new("cmd-q", Quit, None),
         ]);
     } else {
@@ -62,6 +71,12 @@ fn bind_keys(cx: &mut App) {
             KeyBinding::new("ctrl-0", ResetFontSize, ctx),
             KeyBinding::new("ctrl-,", OpenSettings, None),
             KeyBinding::new("ctrl-shift-n", NewWindow, None),
+            KeyBinding::new("ctrl-shift-t", NewTab, None),
+            KeyBinding::new("ctrl-shift-w", CloseTab, None),
+            KeyBinding::new("ctrl-tab", NextTab, None),
+            KeyBinding::new("ctrl-shift-tab", PreviousTab, None),
+            KeyBinding::new("ctrl-pagedown", NextTab, None),
+            KeyBinding::new("ctrl-pageup", PreviousTab, None),
         ]);
     }
 }
@@ -77,7 +92,7 @@ fn open_terminal_window(cx: &mut App) {
             }),
             ..Default::default()
         },
-        |window, cx| cx.new(|cx| TerminalView::new(window, cx)),
+        |window, cx| cx.new(|cx| Workspace::new(window, cx)),
     );
     if let Err(err) = result {
         eprintln!("failed to open window: {err}");
@@ -124,6 +139,8 @@ fn set_menus(cx: &mut App) {
             MenuItem::action(tr(cx, "menu-settings"), OpenSettings),
             MenuItem::separator(),
             MenuItem::action(tr(cx, "menu-new-window"), NewWindow),
+            MenuItem::action(tr(cx, "menu-new-tab"), NewTab),
+            MenuItem::action(tr(cx, "menu-close-tab"), CloseTab),
             MenuItem::separator(),
             MenuItem::action(tr(cx, "menu-quit"), Quit),
         ],
@@ -140,6 +157,7 @@ fn main() {
         })
         .detach();
 
+        app_icon::set_app_icon();
         Settings::init(cx);
         bind_keys(cx);
         cx.on_action(|_: &About, cx| {

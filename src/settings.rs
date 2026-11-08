@@ -43,6 +43,33 @@ pub enum ThemeMode {
     Dark,
 }
 
+/// Shell started in new tabs on Windows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WindowsShell {
+    Cmd,
+    PowerShell,
+    Pwsh,
+    /// The first available of `pwsh`, `powershell` and `cmd`.
+    #[default]
+    Auto,
+}
+
+impl WindowsShell {
+    pub const ALL: [Self; 4] = [Self::Cmd, Self::PowerShell, Self::Pwsh, Self::Auto];
+
+    /// Executable name, looked up the way `CreateProcess` does; `None`
+    /// for automatic detection.
+    pub fn program(self) -> Option<&'static str> {
+        match self {
+            Self::Cmd => Some("cmd.exe"),
+            Self::PowerShell => Some("powershell.exe"),
+            Self::Pwsh => Some("pwsh.exe"),
+            Self::Auto => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -54,6 +81,7 @@ pub struct Settings {
     pub light_theme: FlavorName,
     /// Flavor used when the theme resolves to dark.
     pub dark_theme: FlavorName,
+    pub windows_shell: WindowsShell,
 }
 
 impl Default for Settings {
@@ -65,6 +93,7 @@ impl Default for Settings {
             theme_mode: ThemeMode::System,
             light_theme: FlavorName::Latte,
             dark_theme: FlavorName::Mocha,
+            windows_shell: WindowsShell::Auto,
         }
     }
 }
@@ -97,6 +126,15 @@ impl Settings {
         }
         save(&settings);
         cx.set_global(settings);
+    }
+
+    /// Program to run in new terminals; `None` for the platform default.
+    pub fn shell(&self) -> Option<&'static str> {
+        if cfg!(windows) {
+            self.windows_shell.program()
+        } else {
+            None
+        }
     }
 
     pub fn font_size(&self) -> Pixels {

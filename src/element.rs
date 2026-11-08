@@ -1,17 +1,19 @@
 //! Custom GPUI element that lays out and paints the terminal cell grid.
 //!
-//! Each row is shaped as one line (so font fallback and emoji work), then
-//! every glyph is placed at the x position of the cell it came from, which
-//! keeps the grid exact regardless of font advances.
+//! Ordinary text in each row is shaped as one line (so font fallback and
+//! emoji work), then glyphs are placed at their cells' x positions. Unicode
+//! box drawing and block elements instead fill device-aligned cell geometry,
+//! independent of font advances and the extra spacing between text rows.
 
 use gpui::{
-    App, BorderStyle, Bounds, ContentMask, Element, ElementId, Entity, Focusable,
-    GlobalElementId, Hsla, InspectorElementId, IntoElement, LayoutId, MouseMoveEvent, PaintQuad,
-    Pixels, Point, Rgba, ShapedLine, SharedString, Style, TextRun, UnderlineStyle, Window,
-    DispatchPhase, fill, outline, point, px, relative, size,
+    App, BorderStyle, Bounds, ContentMask, CursorStyle, Element, ElementId, Entity, Focusable,
+    GlobalElementId, Hitbox, HitboxBehavior, Hsla, InspectorElementId, IntoElement, LayoutId,
+    MouseMoveEvent, PaintQuad, Pixels, Point, Rgba, ShapedLine, SharedString, Style, TextRun,
+    UnderlineStyle, Window, DispatchPhase, fill, outline, point, px, relative, size,
 };
 
-use crate::view::{GridLayout, PADDING, TerminalInputHandler, TerminalView};
+use crate::box_drawing;
+use crate::view::{GridLayout, PADDING, SCROLLBAR_WIDTH, TerminalInputHandler, TerminalView};
 use crate::vt::{CursorShape, Frame, Rgb, Underline};
 
 pub struct TerminalElement {
@@ -40,6 +42,9 @@ fn snap(value: Pixels, scale: f32) -> Pixels {
 }
 
 const NO_COLUMN: u16 = u16::MAX;
+const THUMB_WIDTH: Pixels = px(6.);
+/// Gap between the thumb and the ends of its slot.
+const THUMB_INSET: Pixels = px(2.);
 
 struct RowGlyphs {
     line: ShapedLine,
@@ -57,6 +62,8 @@ pub struct Prepared {
     background: Hsla,
     backgrounds: Vec<PaintQuad>,
     rows: Vec<RowGlyphs>,
+    /// Row, column and scalar of cell-filling procedural symbols.
+    symbols: Vec<(usize, u16, char)>,
     decorations: Vec<PaintQuad>,
     /// Filled block cursor, painted beneath the text.
     cursor_block: Option<PaintQuad>,
@@ -65,6 +72,8 @@ pub struct Prepared {
     /// Cell whose glyph is drawn in a contrasting color under a block cursor.
     cursor_text: Option<(usize, u16, Hsla)>,
     marked: Option<(Point<Pixels>, ShapedLine, PaintQuad)>,
+    /// Scrollbar thumb, and the track's hitbox for the arrow cursor.
+    scrollbar: Option<(PaintQuad, Hitbox)>,
 }
 
 impl IntoElement for TerminalElement {
@@ -130,7 +139,7 @@ impl Element for TerminalElement {
             // `baseline_offset` assumes a positive descent, so it is not used.
             let baseline = snap((line_height - ascent - descent) / 2. + ascent, scale);
 
-            let inner = bounds.size - size(PADDING * 2., PADDING * 2.);
+            let inner = bounds.size - size(PADDING * 2. + SCROLLBAR_WIDTH, PADDING * 2.);
             let cols = (f32::from(inner.width) / f32::from(cell_width)).floor().max(1.) as u16;
             let rows = (f32::from(inner.height) / f32::from(line_height)).floor().max(1.) as u16;
             let layout = GridLayout {
@@ -151,7 +160,8 @@ impl Element for TerminalElement {
                 font.bold().italic(),
             ];
             let frame = view.snapshot();
-            build(
+            let foreground = hsla(frame.foreground);
+            let mut prepared = build(
                 frame,
                 layout,
                 &fonts,
@@ -162,7 +172,21 @@ impl Element for TerminalElement {
                 focused,
                 marked_text,
                 window,
-            )
+            );
+            prepared.scrollbar = view.scrollbar_thumb().map(|(slot, highlighted)| {
+                let thumb = Bounds::new(
+                    point(
+                        slot.center().x - THUMB_WIDTH / 2.,
+                        slot.top() + THUMB_INSET,
+                    ),
+                    size(THUMB_WIDTH, slot.size.height - THUMB_INSET * 2.),
+                );
+                let color = foreground.opacity(if highlighted { 0.5 } else { 0.25 });
+                let quad = fill(thumb, color).corner_radii(THUMB_WIDTH / 2.);
+                let hitbox = window.insert_hitbox(layout.scrollbar_track(), HitboxBehavior::Normal);
+                (quad, hitbox)
+            });
+            prepared
         })
     }
 
@@ -247,6 +271,26 @@ impl Element for TerminalElement {
                 }
             }
 
+            for &(row, column, ch) in &prepared.symbols {
+                let color = match prepared.cursor_text {
+                    Some((r, c, color)) if r == row && c == column => color,
+                    _ => prepared.rows[row].colors[column as usize],
+                };
+                box_drawing::paint(
+                    ch,
+                    Bounds::new(
+                        origin + point(
+                            layout.cell_width * column as f32,
+                            layout.line_height * row as f32,
+                        ),
+                        size(layout.cell_width, layout.line_height),
+                    ),
+                    prepared.font_size,
+                    color,
+                    window,
+                );
+            }
+
             for quad in prepared.decorations.drain(..) {
                 window.paint_quad(quad);
             }
@@ -256,6 +300,10 @@ impl Element for TerminalElement {
             if let Some((position, line, background)) = prepared.marked.take() {
                 window.paint_quad(background);
                 let _ = line.paint(position, layout.line_height, window, cx);
+            }
+            if let Some((thumb, hitbox)) = prepared.scrollbar.take() {
+                window.paint_quad(thumb);
+                window.set_cursor_style(CursorStyle::Arrow, &hitbox);
             }
         });
     }
@@ -285,6 +333,7 @@ fn build(
     let mut backgrounds = Vec::new();
     let mut decorations = Vec::new();
     let mut rows = Vec::with_capacity(frame.lines.len());
+    let mut symbols = Vec::new();
 
     for (row_index, line) in frame.lines.iter().enumerate() {
         let top = origin.y + lh * row_index as f32;
@@ -355,6 +404,10 @@ fn build(
 
             let cell_text = &line.text[cell.text.start as usize..cell.text.end as usize];
             if cell.invisible || cell_text.is_empty() || cell_text == " " {
+                continue;
+            }
+            if let Some(ch) = box_drawing::character(cell_text) {
+                symbols.push((row_index, col as u16, ch));
                 continue;
             }
             // Separate non-adjacent cells so they cannot shape together.
@@ -453,11 +506,13 @@ fn build(
         background,
         backgrounds,
         rows,
+        symbols,
         decorations,
         cursor_block,
         cursor_overlay,
         cursor_text,
         marked,
+        scrollbar: None,
     }
 }
 

@@ -1,0 +1,2 @@
+// GPUI loads resource ID 1 for its Windows window and taskbar icon.
+1 ICON "terminal.ico"
