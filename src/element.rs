@@ -121,10 +121,14 @@ impl Element for TerminalElement {
                 .map(|advance| advance.width)
                 .unwrap_or(font_size * 0.6);
             let ascent = text_system.ascent(font_id, font_size);
-            let descent = text_system.descent(font_id, font_size);
+            // The sign of the reported descent differs by platform (negative
+            // on macOS and Windows, positive on Linux); only its size counts.
+            let descent = text_system.descent(font_id, font_size).abs();
             let cell_width = snap(advance, scale);
             let line_height = snap((ascent + descent).max(font_size * 1.2), scale);
-            let baseline = snap(text_system.baseline_offset(font_id, font_size, line_height), scale);
+            // Center the font's ascent + descent box in the cell. GPUI's
+            // `baseline_offset` assumes a positive descent, so it is not used.
+            let baseline = snap((line_height - ascent - descent) / 2. + ascent, scale);
 
             let inner = bounds.size - size(PADDING * 2., PADDING * 2.);
             let cols = (f32::from(inner.width) / f32::from(cell_width)).floor().max(1.) as u16;
