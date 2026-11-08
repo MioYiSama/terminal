@@ -5493,7 +5493,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sys-locale",
- "unic-langid",
  "unicode-segmentation",
 ]
 
