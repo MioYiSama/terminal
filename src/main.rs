@@ -5,6 +5,7 @@ mod about;
 mod element;
 mod i18n;
 mod keys;
+mod menu_bar;
 mod pty;
 mod settings;
 mod settings_view;

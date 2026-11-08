@@ -7,7 +7,7 @@ use std::time::Instant;
 use futures::StreamExt;
 use ghostty_sys::*;
 use gpui::{
-    App, Bounds, ClipboardItem, Context, CursorStyle, EntityInputHandler, FocusHandle, Focusable,
+    App, Bounds, ClipboardItem, Context, CursorStyle, Entity, EntityInputHandler, FocusHandle, Focusable,
     Font, KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     Pixels, Point, PromptLevel, Render, ScrollDelta, ScrollWheelEvent, Subscription, Task,
     UTF16Selection, Window, actions, div, font, point, prelude::*, px, size,
@@ -15,6 +15,7 @@ use gpui::{
 
 use crate::element::TerminalElement;
 use crate::keys;
+use crate::menu_bar::{self, MenuBar};
 use crate::pty::{Pty, PtyEvent};
 use crate::settings::{MAX_FONT_SIZE, MIN_FONT_SIZE, Settings};
 use crate::theme;
@@ -106,6 +107,7 @@ pub struct TerminalView {
     reported_button: Option<GhosttyMouseButton>,
     selecting: bool,
     epoch: Instant,
+    menu_bar: Option<Entity<MenuBar>>,
     _subscriptions: Vec<Subscription>,
     _io: Task<()>,
 }
@@ -186,6 +188,7 @@ impl TerminalView {
             reported_button: None,
             selecting: false,
             epoch: Instant::now(),
+            menu_bar: menu_bar::ENABLED.then(|| cx.new(|_| MenuBar::default())),
             _subscriptions: subscriptions,
             _io: io,
         }
@@ -704,11 +707,12 @@ impl Focusable for TerminalView {
 
 impl Render for TerminalView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
+        let terminal = div()
             .id("terminal")
             .key_context(KEY_CONTEXT)
             .track_focus(&self.focus_handle)
-            .size_full()
+            .flex_1()
+            .min_h_0()
             .cursor(CursorStyle::IBeam)
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::paste))
@@ -732,7 +736,13 @@ impl Render for TerminalView {
             .on_mouse_up(MouseButton::Middle, cx.listener(Self::mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::mouse_up))
             .on_scroll_wheel(cx.listener(Self::scroll_wheel))
-            .child(TerminalElement::new(cx.entity()))
+            .child(TerminalElement::new(cx.entity()));
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .children(self.menu_bar.clone())
+            .child(terminal)
     }
 }
 
