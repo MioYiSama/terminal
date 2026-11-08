@@ -30,3 +30,8 @@ settings-no-matching-fonts = 没有匹配的字体
 settings-preview =
     The quick brown fox jumps over the lazy dog
     敏捷的棕色狐狸跳过了那只懒狗
+
+paste-unsafe-title = 粘贴的内容可能会直接执行命令
+paste-unsafe-detail = 剪贴板文本包含换行或控制字符。确定要粘贴吗？
+paste-unsafe-confirm = 粘贴
+paste-unsafe-cancel = 取消

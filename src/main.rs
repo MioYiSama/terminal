@@ -6,6 +6,8 @@ mod app_icon;
 mod box_drawing;
 mod clipboard;
 mod element;
+mod font_picker;
+mod grid;
 mod i18n;
 mod images;
 mod keys;
@@ -14,8 +16,10 @@ mod menu_button;
 mod pty;
 mod settings;
 mod settings_view;
+mod shell;
 mod text_input;
 mod theme;
+mod utf16;
 mod view;
 mod vt;
 mod workspace;
@@ -39,7 +43,7 @@ actions!(app, [About, OpenSettings, NewWindow, Quit]);
 
 fn bind_keys(cx: &mut App) {
     text_input::bind_keys(cx);
-    settings_view::bind_keys(cx);
+    font_picker::bind_keys(cx);
     let ctx = Some(KEY_CONTEXT);
     if cfg!(target_os = "macos") {
         cx.bind_keys([
@@ -171,6 +175,16 @@ fn main() {
             open_or_activate(cx, "settings-title", size(px(720.), px(760.)), SettingsView::new)
         });
         cx.on_action(|_: &NewWindow, cx| open_terminal_window(cx));
+        // Terminal windows close their tab; windows without tabs (About,
+        // Settings) leave the action to this fallback and close.
+        cx.on_action(|_: &CloseTab, cx| {
+            if let Some(window) = cx.active_window() {
+                // The window is borrowed while it dispatches the action.
+                cx.defer(move |cx| {
+                    let _ = window.update(cx, |_, window, _| window.remove_window());
+                });
+            }
+        });
         cx.on_action(|_: &Quit, cx| cx.quit());
         set_menus(cx);
         let mut language = Settings::get(cx).language.resolve();

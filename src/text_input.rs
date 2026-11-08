@@ -14,6 +14,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::settings::Settings;
 use crate::theme::UiColors;
+use crate::utf16;
 
 actions!(
     text_input,
@@ -281,38 +282,12 @@ impl TextInput {
         cx.notify()
     }
 
-    fn offset_from_utf16(&self, offset: usize) -> usize {
-        let mut utf8_offset = 0;
-        let mut utf16_count = 0;
-        for ch in self.content.chars() {
-            if utf16_count >= offset {
-                break;
-            }
-            utf16_count += ch.len_utf16();
-            utf8_offset += ch.len_utf8();
-        }
-        utf8_offset
-    }
-
-    fn offset_to_utf16(&self, offset: usize) -> usize {
-        let mut utf16_offset = 0;
-        let mut utf8_count = 0;
-        for ch in self.content.chars() {
-            if utf8_count >= offset {
-                break;
-            }
-            utf8_count += ch.len_utf8();
-            utf16_offset += ch.len_utf16();
-        }
-        utf16_offset
-    }
-
     fn range_to_utf16(&self, range: &Range<usize>) -> Range<usize> {
-        self.offset_to_utf16(range.start)..self.offset_to_utf16(range.end)
+        utf16::from_byte(&self.content, range.start)..utf16::from_byte(&self.content, range.end)
     }
 
     fn range_from_utf16(&self, range_utf16: &Range<usize>) -> Range<usize> {
-        self.offset_from_utf16(range_utf16.start)..self.offset_from_utf16(range_utf16.end)
+        utf16::to_byte(&self.content, range_utf16.start)..utf16::to_byte(&self.content, range_utf16.end)
     }
 
     fn previous_boundary(&self, offset: usize) -> usize {
@@ -420,17 +395,8 @@ impl EntityInputHandler for TextInput {
         // The new selection is relative to the inserted (marked) text.
         self.selected_range = new_selected_range_utf16
             .map(|selected| {
-                let to_utf8 = |utf16: usize| {
-                    let mut units = 0;
-                    for (offset, ch) in new_text.char_indices() {
-                        if units >= utf16 {
-                            return offset;
-                        }
-                        units += ch.len_utf16();
-                    }
-                    new_text.len()
-                };
-                range.start + to_utf8(selected.start)..range.start + to_utf8(selected.end)
+                range.start + utf16::to_byte(new_text, selected.start)
+                    ..range.start + utf16::to_byte(new_text, selected.end)
             })
             .unwrap_or_else(|| {
                 let cursor = range.start + new_text.len();
@@ -464,7 +430,7 @@ impl EntityInputHandler for TextInput {
         let bounds = self.last_bounds?;
         let last_layout = self.last_layout.as_ref()?;
         let utf8_index = last_layout.index_for_x(point.x - bounds.left())?;
-        Some(self.offset_to_utf16(utf8_index))
+        Some(utf16::from_byte(&self.content, utf8_index))
     }
 }
 

@@ -1,17 +1,17 @@
-//! Clipboard contents as terminal input. Copied files paste as their
-//! shell-escaped paths and copied images as the path of a file holding the
-//! image, which is how programs such as coding agents take attachments;
-//! anything else pastes as text.
+//! Clipboard contents as terminal input. Copied files paste as their paths
+//! and copied images as the path of a file holding the image, which is how
+//! programs such as coding agents take attachments; anything else pastes as
+//! text. Quoting paths for the shell is up to the caller.
 
 use std::borrow::Cow;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use gpui::{App, ClipboardEntry, Image, ImageFormat};
 
 pub enum Content {
-    /// Space-separated, shell-escaped paths of copied files.
-    Paths(String),
+    /// Copied files.
+    Paths(Vec<PathBuf>),
     /// A copied image; [`save_image`] turns it into a path to paste.
     Image(Image),
     Text(String),
@@ -22,14 +22,14 @@ pub fn read(cx: &App) -> Option<Content> {
     {
         let files = native::file_paths();
         if !files.is_empty() {
-            return Some(Content::Paths(join_escaped(&files)));
+            return Some(Content::Paths(files));
         }
     }
     let item = cx.read_from_clipboard()?;
     if let Some(text) = item.text() {
         #[cfg(not(any(target_os = "macos", windows)))]
         if let Some(files) = file_uris(&text) {
-            return Some(Content::Paths(join_escaped(&files)));
+            return Some(Content::Paths(files));
         }
         return Some(Content::Text(text));
     }
@@ -41,9 +41,9 @@ pub fn read(cx: &App) -> Option<Content> {
 
 /// Write the image to the per-user temporary directory, named after its
 /// content so pasting the same image again reuses the file, and return its
-/// shell-escaped path. TIFF (all that many macOS apps copy) and BMP become
+/// path. TIFF (all that many macOS apps copy) and BMP become
 /// PNG: programs taking image paths accept PNG but not those.
-pub fn save_image(image: &Image) -> io::Result<String> {
+pub fn save_image(image: &Image) -> io::Result<PathBuf> {
     let (bytes, extension) = match image.format {
         ImageFormat::Png => (Cow::Borrowed(&image.bytes), "png"),
         ImageFormat::Jpeg => (Cow::Borrowed(&image.bytes), "jpg"),
@@ -59,7 +59,7 @@ pub fn save_image(image: &Image) -> io::Result<String> {
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("image-{:016x}.{extension}", image.id()));
     std::fs::write(&path, bytes.as_slice())?;
-    Ok(join_escaped(&[path]))
+    Ok(path)
 }
 
 fn to_png(bytes: &[u8], format: image::ImageFormat) -> io::Result<Vec<u8>> {
@@ -69,41 +69,6 @@ fn to_png(bytes: &[u8], format: image::ImageFormat) -> io::Result<Vec<u8>> {
         .write_to(&mut io::Cursor::new(&mut png), image::ImageFormat::Png)
         .map_err(io::Error::other)?;
     Ok(png)
-}
-
-fn join_escaped(paths: &[PathBuf]) -> String {
-    let escaped: Vec<String> = paths.iter().map(|path| escape(path)).collect();
-    escaped.join(" ")
-}
-
-/// Backslash-escape what POSIX shells, zsh and fish treat specially, as
-/// macOS terminals do for dropped files. Newlines stay as they are: an
-/// escaped newline would be a line continuation.
-#[cfg(not(windows))]
-fn escape(path: &Path) -> String {
-    const SPECIAL: &str = " \t\\'\"`$*?|&;()<>[]{}!#~";
-    let path = path.to_string_lossy();
-    let mut out = String::with_capacity(path.len());
-    for c in path.chars() {
-        if SPECIAL.contains(c) {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out
-}
-
-/// Double-quote paths with spaces or shell punctuation, which PowerShell and
-/// cmd.exe both accept; Windows file names cannot contain `"`.
-#[cfg(windows)]
-fn escape(path: &Path) -> String {
-    const SPECIAL: &str = " \t&()[]{}^=;!'+,`~$@#%";
-    let path = path.to_string_lossy();
-    if path.contains(|c| SPECIAL.contains(c)) {
-        format!("\"{path}\"")
-    } else {
-        path.into_owned()
-    }
 }
 
 /// Linux file managers offer copied files as a list of `file://` URIs (KDE
@@ -216,21 +181,10 @@ mod native {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(any(target_os = "macos", windows))))]
 mod tests {
     use super::*;
 
-    #[cfg(not(windows))]
-    #[test]
-    fn escapes_shell_metacharacters_but_not_newlines() {
-        assert_eq!(
-            escape(Path::new("/tmp/My Shot (1)/it's $HOME*.png")),
-            r"/tmp/My\ Shot\ \(1\)/it\'s\ \$HOME\*.png"
-        );
-        assert_eq!(escape(Path::new("/a\nb")), "/a\nb");
-    }
-
-    #[cfg(not(any(target_os = "macos", windows)))]
     #[test]
     fn reads_file_uri_lists_only() {
         assert_eq!(

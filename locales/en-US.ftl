@@ -28,3 +28,8 @@ settings-font-family = Family
 settings-search-fonts = Search fonts
 settings-no-matching-fonts = No matching fonts
 settings-preview = The quick brown fox jumps over the lazy dog
+
+paste-unsafe-title = The pasted text may run commands right away
+paste-unsafe-detail = The clipboard text contains line breaks or control characters. Paste it anyway?
+paste-unsafe-confirm = Paste
+paste-unsafe-cancel = Cancel

@@ -6,25 +6,29 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
-use ghostty_sys::*;
 use gpui::{
-    App, Bounds, ClipboardItem, Context, CursorStyle, EntityInputHandler, EventEmitter, FocusHandle, Focusable,
-    Font, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    Pixels, Point, PromptLevel, Render, RenderImage, ScrollDelta, ScrollWheelEvent, SharedString, Subscription,
-    Task, UTF16Selection, Window, actions, div, font, point, prelude::*, px, size,
+    App, Bounds, ClipboardItem, Context, CursorStyle, EntityInputHandler, EventEmitter, FocusHandle,
+    Focusable, Font, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, PromptLevel, Render, RenderImage, ScrollDelta,
+    ScrollWheelEvent, SharedString, Subscription, Task, UTF16Selection, Window, actions, div, font,
+    prelude::*, px, size,
 };
 
 use crate::clipboard::{self, Content};
 use crate::element::TerminalElement;
+use crate::grid::GridLayout;
+use crate::i18n::tr;
 use crate::images::ImageCache;
 use crate::keys;
 use crate::links::{self, Link};
 use crate::pty::{Pty, PtyEvent};
 use crate::settings::{MAX_FONT_SIZE, MIN_FONT_SIZE, Settings};
+use crate::shell::ShellKind;
 use crate::theme;
+use crate::utf16;
 use crate::vt::{
-    self, Frame, GesturePoint, ImagePlacement, KeyEncoder, KeyInput, MouseEncoder, RenderState, Scrollbar,
-    SelectionGesture, SurfaceSize, Terminal,
+    self, Frame, ImagePlacement, KeyAction, KeyEncoder, KeyInput, MouseAction, MouseEncoder,
+    MouseInput, PasteOutcome, RenderState, Scrollbar, Terminal,
 };
 
 actions!(
@@ -40,120 +44,12 @@ actions!(
 );
 
 pub const KEY_CONTEXT: &str = "Terminal";
-pub const PADDING: Pixels = px(6.);
-/// Width reserved for the scrollbar right of the grid's padding.
-pub const SCROLLBAR_WIDTH: Pixels = px(10.);
-const MIN_THUMB_HEIGHT: Pixels = px(24.);
 const MODE_FOCUS_EVENT: u16 = 1004;
 const MODE_ALTERNATE_SCROLL: u16 = 1007;
 /// Shortest wait between animation redraws (about 120 Hz).
 const MIN_FRAME_INTERVAL: Duration = Duration::from_millis(8);
-
-/// Cell grid geometry as laid out in the last frame, in window coordinates.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct GridLayout {
-    pub bounds: Bounds<Pixels>,
-    pub cell_width: Pixels,
-    pub line_height: Pixels,
-    pub cols: u16,
-    pub rows: u16,
-    /// Device pixels per logical pixel. The terminal and the program see
-    /// device pixels, like in Ghostty, so images are sized for the screen.
-    pub scale: f32,
-}
-
-impl GridLayout {
-    /// A logical length in whole device pixels. Cell sizes are snapped to
-    /// device pixels, so these are exact.
-    pub fn device(&self, value: Pixels) -> u32 {
-        (f32::from(value) * self.scale).round() as u32
-    }
-
-    /// A device-pixel length as a logical one.
-    pub fn logical(&self, value: f32) -> Pixels {
-        px(value / self.scale)
-    }
-
-    fn grid_origin(&self) -> Point<Pixels> {
-        self.bounds.origin + point(PADDING, PADDING)
-    }
-
-    /// Cell under a window-space position, or `None` outside the grid.
-    fn cell_containing(&self, position: Point<Pixels>) -> Option<(u16, u16)> {
-        let local = position - self.grid_origin();
-        let col = (f32::from(local.x) / f32::from(self.cell_width)).floor();
-        let row = (f32::from(local.y) / f32::from(self.line_height)).floor();
-        (col >= 0. && row >= 0. && col < self.cols as f32 && row < self.rows as f32)
-            .then_some((col as u16, row as u16))
-    }
-
-    /// Cell under a window-space position, clamped to the grid.
-    fn cell_at(&self, position: Point<Pixels>) -> (u16, u16) {
-        let local = position - self.grid_origin();
-        let col = (f32::from(local.x) / f32::from(self.cell_width)).floor();
-        let row = (f32::from(local.y) / f32::from(self.line_height)).floor();
-        (
-            col.clamp(0., self.cols.saturating_sub(1) as f32) as u16,
-            row.clamp(0., self.rows.saturating_sub(1) as f32) as u16,
-        )
-    }
-
-    /// Position relative to the element ("surface space") in device pixels.
-    fn surface_position(&self, position: Point<Pixels>) -> (f32, f32) {
-        let local = position - self.bounds.origin;
-        (f32::from(local.x) * self.scale, f32::from(local.y) * self.scale)
-    }
-
-    /// The scrollbar's gutter along the element's right edge.
-    pub fn scrollbar_track(&self) -> Bounds<Pixels> {
-        Bounds::new(
-            point(self.bounds.right() - SCROLLBAR_WIDTH, self.bounds.top()),
-            size(SCROLLBAR_WIDTH, self.bounds.size.height),
-        )
-    }
-
-    /// The thumb's slot in the track (full gutter width), or `None` when
-    /// there is nothing to scroll.
-    pub fn scrollbar_thumb(&self, bar: Scrollbar) -> Option<Bounds<Pixels>> {
-        if !bar.scrollable() {
-            return None;
-        }
-        let track = self.scrollbar_track();
-        let height = track.size.height;
-        let thumb = (height * (bar.len as f32 / bar.total as f32))
-            .max(MIN_THUMB_HEIGHT)
-            .min(height);
-        let top = (height - thumb) * (bar.offset as f32 / bar.max_offset() as f32);
-        Some(Bounds::new(
-            point(track.left(), track.top() + top),
-            size(track.size.width, thumb),
-        ))
-    }
-
-    /// The scroll offset that puts the thumb's top edge at window-space `y`.
-    fn scrollbar_offset_at(&self, bar: Scrollbar, y: Pixels) -> u64 {
-        let Some(thumb) = self.scrollbar_thumb(bar) else {
-            return 0;
-        };
-        let track = self.scrollbar_track();
-        let range = f32::from(track.size.height - thumb.size.height);
-        if range <= 0. {
-            return 0;
-        }
-        let fraction = (f32::from(y - track.top()) / range).clamp(0., 1.);
-        (fraction * bar.max_offset() as f32).round() as u64
-    }
-
-    fn surface_size(&self) -> SurfaceSize {
-        SurfaceSize {
-            width: self.device(self.bounds.size.width - SCROLLBAR_WIDTH),
-            height: self.device(self.bounds.size.height),
-            cell_width: self.device(self.cell_width),
-            cell_height: self.device(self.line_height),
-            padding: self.device(PADDING),
-        }
-    }
-}
+/// Mouse buttons the view listens to, for presses and releases alike.
+const MOUSE_BUTTONS: [MouseButton; 3] = [MouseButton::Left, MouseButton::Right, MouseButton::Middle];
 
 pub enum TerminalEvent {
     TitleChanged,
@@ -161,9 +57,16 @@ pub enum TerminalEvent {
     Exited,
 }
 
+/// IME composition text, shown at the cursor until committed. Offsets the
+/// platform exchanges are UTF-16 and relative to this text.
+#[derive(Default)]
+struct Composition {
+    text: String,
+    /// Caret or selection within `text`, in UTF-16 units.
+    selected: Range<usize>,
+}
+
 pub struct TerminalView {
-    // Declared before `terminal`: freeing the gesture touches the terminal.
-    gesture: SelectionGesture,
     terminal: Terminal,
     render_state: RenderState,
     frame: Frame,
@@ -176,12 +79,11 @@ pub struct TerminalView {
     /// Font size from the settings; zooming changes `font_size` only.
     base_font_size: Pixels,
     layout: Option<GridLayout>,
-    /// IME composition text, shown at the cursor until committed.
-    marked_text: String,
+    composition: Composition,
     /// Fractional scroll lines carried between wheel events.
     scroll_remainder: f32,
     /// Button currently reported to the program via mouse tracking.
-    reported_button: Option<GhosttyMouseButton>,
+    reported_button: Option<vt::MouseButton>,
     selecting: bool,
     /// Scroll position as of the last frame.
     scrollbar: Scrollbar,
@@ -194,6 +96,8 @@ pub struct TerminalView {
     /// Cmd (Ctrl off macOS) is held: links in the text are found too, and
     /// links open on click.
     link_modifier: bool,
+    /// The cell `hovered_link` was resolved for.
+    hovered_cell: Option<(u16, u16)>,
     hovered_link: Option<Link>,
     /// Title set by the program (OSC 0/2); empty if none.
     title: SharedString,
@@ -213,7 +117,6 @@ impl TerminalView {
         let font_family = settings.font_family.clone();
         let font_size = settings.font_size();
         terminal.set_colors(&theme::terminal_colors(settings.flavor(window.appearance())));
-        let gesture = SelectionGesture::new(&terminal);
 
         let (pty, events) = match Pty::spawn(settings.shell(), cols, rows, 8, 16) {
             Ok((pty, events)) => (Some(pty), Some(events)),
@@ -232,7 +135,7 @@ impl TerminalView {
                         PtyEvent::Exited => Vec::new(),
                     };
                     // Coalesce whatever else is already queued into one update.
-                    while let Ok(event) = events.try_recv() {
+                    while !exited && let Ok(event) = events.try_recv() {
                         match event {
                             PtyEvent::Output(bytes) => output.extend_from_slice(&bytes),
                             PtyEvent::Exited => exited = true,
@@ -264,7 +167,6 @@ impl TerminalView {
         focus_handle.focus(window);
 
         Self {
-            gesture,
             terminal,
             render_state: RenderState::new(),
             frame: Frame::default(),
@@ -276,7 +178,7 @@ impl TerminalView {
             font_size,
             base_font_size: font_size,
             layout: None,
-            marked_text: String::new(),
+            composition: Composition::default(),
             scroll_remainder: 0.,
             reported_button: None,
             selecting: false,
@@ -285,6 +187,7 @@ impl TerminalView {
             scrollbar_hovered: false,
             pointer: None,
             link_modifier: false,
+            hovered_cell: None,
             hovered_link: None,
             title: SharedString::default(),
             epoch: Instant::now(),
@@ -304,7 +207,7 @@ impl TerminalView {
     }
 
     pub fn marked_text(&self) -> &str {
-        &self.marked_text
+        &self.composition.text
     }
 
     pub fn is_focused(&self, window: &Window) -> bool {
@@ -330,27 +233,17 @@ impl TerminalView {
     /// Apply the grid size the element computed, resizing the terminal and
     /// the pty when the cell grid changes.
     pub fn set_layout(&mut self, layout: GridLayout) {
-        let resized = self
-            .layout
-            .is_none_or(|old| {
-                (old.cols, old.rows, old.device(old.cell_width), old.device(old.line_height))
-                    != (
-                        layout.cols,
-                        layout.rows,
-                        layout.device(layout.cell_width),
-                        layout.device(layout.line_height),
-                    )
-            });
+        let resized = self.layout.is_none_or(|old| old.grid_changed(&layout));
         self.layout = Some(layout);
         if !resized {
             return;
         }
-        let cell_width = layout.device(layout.cell_width) as u16;
-        let cell_height = layout.device(layout.line_height) as u16;
+        let cell_width = layout.device(layout.cell_width);
+        let cell_height = layout.device(layout.line_height);
         self.terminal
-            .resize(layout.cols, layout.rows, cell_width as u32, cell_height as u32);
+            .resize(layout.cols, layout.rows, cell_width, cell_height);
         if let Some(pty) = &self.pty {
-            pty.resize(layout.cols, layout.rows, cell_width, cell_height);
+            pty.resize(layout.cols, layout.rows, cell_width as u16, cell_height as u16);
         }
         self.flush_replies();
     }
@@ -361,7 +254,8 @@ impl TerminalView {
         self.render_state.snapshot(&self.terminal, &mut self.frame);
         self.scrollbar = self.terminal.scrollbar();
         // Output may have moved or replaced the link under the pointer.
-        self.hovered_link = self.link_under_pointer();
+        self.hovered_cell = self.pointer_cell();
+        self.hovered_link = self.link_at(self.hovered_cell);
         &self.frame
     }
 
@@ -375,10 +269,14 @@ impl TerminalView {
         self.link_modifier
     }
 
+    fn pointer_cell(&self) -> Option<(u16, u16)> {
+        self.layout?.cell_containing(self.pointer?)
+    }
+
     /// OSC 8 hyperlinks are shown on hover; URLs and paths in the text only
     /// while the link modifier is held, since finding them is a guess.
-    fn link_under_pointer(&self) -> Option<Link> {
-        let (col, row) = self.layout?.cell_containing(self.pointer?)?;
+    fn link_at(&self, cell: Option<(u16, u16)>) -> Option<Link> {
+        let (col, row) = cell?;
         let text_links = self
             .link_modifier
             .then_some(|| self.pty.as_ref()?.foreground_cwd());
@@ -388,11 +286,18 @@ impl TerminalView {
     /// The pointer left the window.
     pub fn mouse_exit(&mut self, cx: &mut Context<Self>) {
         self.pointer = None;
-        self.update_hovered_link(cx);
+        self.update_hovered_link(false, cx);
     }
 
-    fn update_hovered_link(&mut self, cx: &mut Context<Self>) {
-        let link = self.link_under_pointer();
+    /// Resolve the hovered link again if the pointer is over another cell
+    /// than last time, or if `force`d because what links are shown changed.
+    fn update_hovered_link(&mut self, force: bool, cx: &mut Context<Self>) {
+        let cell = self.pointer_cell();
+        if !force && cell == self.hovered_cell {
+            return;
+        }
+        self.hovered_cell = cell;
+        let link = self.link_at(cell);
         if link != self.hovered_link {
             self.hovered_link = link;
             cx.notify();
@@ -409,14 +314,15 @@ impl TerminalView {
     }
 
     fn set_link_modifier(&mut self, held: bool, cx: &mut Context<Self>) {
-        if held != self.link_modifier {
+        let changed = held != self.link_modifier;
+        if changed {
             self.link_modifier = held;
             // A hovered link's cursor changes even when the link stays.
             if self.hovered_link.is_some() {
                 cx.notify();
             }
         }
-        self.update_hovered_link(cx);
+        self.update_hovered_link(changed, cx);
     }
 
     /// The last snapshot's images with their textures.
@@ -466,12 +372,16 @@ impl TerminalView {
         cx.notify();
     }
 
+    fn write_to_pty(&self, bytes: Vec<u8>) {
+        if let Some(pty) = &self.pty {
+            pty.write(bytes);
+        }
+    }
+
     /// Forward replies the terminal generated (device status, paste data, …).
     fn flush_replies(&mut self) {
         let replies = self.terminal.take_pty_output();
-        if let Some(pty) = &self.pty {
-            pty.write(replies);
-        }
+        self.write_to_pty(replies);
     }
 
     /// Send user-typed bytes: like other terminals, typing returns the
@@ -481,10 +391,8 @@ impl TerminalView {
             return;
         }
         self.terminal.scroll_to_bottom();
-        self.terminal.set_selection(None);
-        if let Some(pty) = &self.pty {
-            pty.write(bytes);
-        }
+        self.terminal.clear_selection();
+        self.write_to_pty(bytes);
         cx.notify();
     }
 
@@ -492,9 +400,7 @@ impl TerminalView {
         if self.terminal.dec_mode(MODE_FOCUS_EVENT) {
             let mut out = Vec::new();
             vt::encode_focus(focused, &mut out);
-            if let Some(pty) = &self.pty {
-                pty.write(out);
-            }
+            self.write_to_pty(out);
         }
         cx.notify();
     }
@@ -503,7 +409,7 @@ impl TerminalView {
 
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         // While the IME is composing, it owns every key.
-        if !self.marked_text.is_empty() {
+        if !self.composition.text.is_empty() {
             return;
         }
         // Ctrl+V pastes copied files and images as paths. Otherwise it stays
@@ -524,7 +430,7 @@ impl TerminalView {
             return;
         };
         if event.is_held {
-            input.action = GHOSTTY_KEY_ACTION_REPEAT;
+            input.action = KeyAction::Repeat;
         }
         let mut out = Vec::new();
         self.key_encoder.encode(&self.terminal, &input, &mut out);
@@ -535,7 +441,7 @@ impl TerminalView {
     fn key_up(&mut self, event: &KeyUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
         // Releases only matter to programs using the Kitty keyboard protocol
         // with event reporting.
-        if self.terminal.kitty_keyboard_flags() & GHOSTTY_KITTY_KEY_REPORT_EVENTS as u8 == 0 {
+        if !self.terminal.reports_key_releases() {
             return;
         }
         let mut text = String::new();
@@ -543,15 +449,13 @@ impl TerminalView {
             return;
         };
         let input = KeyInput {
-            action: GHOSTTY_KEY_ACTION_RELEASE,
+            action: KeyAction::Release,
             ..input
         };
         let mut out = Vec::new();
         self.key_encoder.encode(&self.terminal, &input, &mut out);
         cx.stop_propagation();
-        if let Some(pty) = &self.pty {
-            pty.write(out);
-        }
+        self.write_to_pty(out);
     }
 
     // ---- actions ----------------------------------------------------------
@@ -568,9 +472,16 @@ impl TerminalView {
         }
     }
 
+    /// Quoting rules for pasted paths: the shell's, or POSIX without one.
+    fn shell(&self) -> ShellKind {
+        self.pty.as_ref().map_or(ShellKind::Posix, Pty::shell)
+    }
+
     fn paste_content(&mut self, content: Content, window: &mut Window, cx: &mut Context<Self>) {
         let image = match content {
-            Content::Paths(text) | Content::Text(text) => {
+            Content::Text(text) => return self.paste_or_confirm(text, window, cx),
+            Content::Paths(paths) => {
+                let text = self.shell().quote_paths(&paths);
                 return self.paste_or_confirm(text, window, cx);
             }
             Content::Image(image) => image,
@@ -581,7 +492,10 @@ impl TerminalView {
             .spawn(async move { clipboard::save_image(&image) });
         cx.spawn_in(window, async move |this, cx| match saved.await {
             Ok(path) => {
-                let _ = this.update_in(cx, |view, window, cx| view.paste_or_confirm(path, window, cx));
+                let _ = this.update_in(cx, |view, window, cx| {
+                    let text = view.shell().quote_paths(&[path]);
+                    view.paste_or_confirm(text, window, cx)
+                });
             }
             Err(err) => eprintln!("failed to save the clipboard image: {err}"),
         })
@@ -589,16 +503,23 @@ impl TerminalView {
     }
 
     fn paste_or_confirm(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
-        if self.paste_text(&text, false, cx) {
+        if self.paste_text(&text, false, cx) != PasteOutcome::Unsafe {
             return;
         }
         // The text could run commands on its own (e.g. contains a newline
         // outside bracketed paste): ask first.
+        let [title, detail, confirm, cancel] = [
+            "paste-unsafe-title",
+            "paste-unsafe-detail",
+            "paste-unsafe-confirm",
+            "paste-unsafe-cancel",
+        ]
+        .map(|id| tr(cx, id));
         let answer = window.prompt(
             PromptLevel::Warning,
-            "粘贴的内容可能会直接执行命令",
-            Some("剪贴板文本包含换行或控制字符。确定要粘贴吗？"),
-            &["粘贴", "取消"],
+            &title,
+            Some(&detail),
+            &[confirm.as_ref(), cancel.as_ref()],
             cx,
         );
         cx.spawn(async move |this, cx| {
@@ -609,13 +530,17 @@ impl TerminalView {
         .detach();
     }
 
-    fn paste_text(&mut self, text: &str, allow_unsafe: bool, cx: &mut Context<Self>) -> bool {
-        if !self.terminal.paste(text, allow_unsafe) {
-            return false;
+    fn paste_text(&mut self, text: &str, allow_unsafe: bool, cx: &mut Context<Self>) -> PasteOutcome {
+        let outcome = self.terminal.paste(text, allow_unsafe);
+        match outcome {
+            PasteOutcome::Written => {
+                let out = self.terminal.take_pty_output();
+                self.send_user_input(out, cx);
+            }
+            PasteOutcome::Failed => eprintln!("failed to paste {} bytes", text.len()),
+            PasteOutcome::Empty | PasteOutcome::Unsafe => {}
         }
-        let out = self.terminal.take_pty_output();
-        self.send_user_input(out, cx);
-        true
+        outcome
     }
 
     fn select_all(&mut self, _: &SelectAll, _window: &mut Window, cx: &mut Context<Self>) {
@@ -638,40 +563,25 @@ impl TerminalView {
 
     fn report_mouse(
         &mut self,
-        action: GhosttyMouseAction,
-        button: Option<GhosttyMouseButton>,
+        action: MouseAction,
+        button: Option<vt::MouseButton>,
         position: Point<Pixels>,
         modifiers: &gpui::Modifiers,
     ) {
         let Some(layout) = self.layout else { return };
         let (x, y) = layout.surface_position(position);
-        let mut out = Vec::new();
-        self.mouse_encoder.encode(
-            &self.terminal,
-            layout.surface_size(),
+        let input = MouseInput {
             action,
             button,
-            self.reported_button.is_some(),
-            keys::ghostty_mods(modifiers),
+            any_button_pressed: self.reported_button.is_some(),
+            mods: keys::ghostty_mods(modifiers),
             x,
             y,
-            &mut out,
-        );
-        if let Some(pty) = &self.pty {
-            pty.write(out);
-        }
-    }
-
-    fn gesture_point(&self, position: Point<Pixels>) -> Option<GesturePoint> {
-        let layout = self.layout?;
-        let (col, row) = layout.cell_at(position);
-        let grid_ref = self.terminal.viewport_ref(col, row)?;
-        let (x, y) = layout.surface_position(position);
-        Some(GesturePoint {
-            grid_ref,
-            x: x as f64,
-            y: y as f64,
-        })
+        };
+        let mut out = Vec::new();
+        self.mouse_encoder
+            .encode(&self.terminal, layout.surface_size(), &input, &mut out);
+        self.write_to_pty(out);
     }
 
     /// Start a thumb drag if the press hit the scrollbar. Pressing the track
@@ -710,33 +620,25 @@ impl TerminalView {
         if event.button == MouseButton::Left && event.modifiers.secondary() {
             self.pointer = Some(event.position);
             self.link_modifier = true;
-            if let Some(link) = self.link_under_pointer() {
+            if let Some(link) = self.link_at(self.pointer_cell()) {
                 cx.open_url(&link.url);
                 return;
             }
         }
         if self.reports_mouse(event.modifiers.shift) {
-            let button = ghostty_button(event.button);
+            let button = keys::mouse_button(event.button);
             self.reported_button = Some(button);
-            self.report_mouse(
-                GHOSTTY_MOUSE_ACTION_PRESS,
-                Some(button),
-                event.position,
-                &event.modifiers,
-            );
+            self.report_mouse(MouseAction::Press, Some(button), event.position, &event.modifiers);
             return;
         }
         if event.button != MouseButton::Left {
             return;
         }
-        let Some(point) = self.gesture_point(event.position) else {
-            return;
-        };
+        let Some(layout) = self.layout else { return };
         let now = self.epoch.elapsed().as_nanos() as u64;
-        // Single clicks only anchor a new selection; double/triple clicks
-        // select a word/line immediately.
-        let selection = self.gesture.press(&self.terminal, &point, now);
-        self.terminal.set_selection(selection.as_ref());
+        let point = layout.gesture_point(event.position);
+        self.terminal
+            .selection_press(&point, layout.surface_size(), now);
         self.selecting = true;
         cx.notify();
     }
@@ -762,7 +664,7 @@ impl TerminalView {
         if self.reports_mouse(event.modifiers.shift) {
             if layout.bounds.contains(&event.position) || self.reported_button.is_some() {
                 self.report_mouse(
-                    GHOSTTY_MOUSE_ACTION_MOTION,
+                    MouseAction::Motion,
                     self.reported_button,
                     event.position,
                     &event.modifiers,
@@ -773,19 +675,13 @@ impl TerminalView {
         if !self.selecting || event.pressed_button != Some(MouseButton::Left) {
             return;
         }
-        let Some(point) = self.gesture_point(event.position) else {
-            return;
-        };
-        let geometry = GhosttySelectionGestureGeometry {
-            columns: layout.cols as u32,
-            cell_width: layout.device(layout.cell_width),
-            padding_left: layout.device(PADDING),
-            screen_height: layout.device(layout.bounds.size.height),
-        };
         // Alt-drag selects a rectangle, like Ghostty.
         let rectangle = event.modifiers.alt;
-        if let Some(selection) = self.gesture.drag(&self.terminal, &point, geometry, rectangle) {
-            self.terminal.set_selection(Some(&selection));
+        let point = layout.gesture_point(event.position);
+        if self
+            .terminal
+            .selection_drag(&point, layout.surface_size(), layout.cols, rectangle)
+        {
             cx.notify();
         }
     }
@@ -795,19 +691,16 @@ impl TerminalView {
             cx.notify();
             return;
         }
-        if let Some(button) = self.reported_button.take() {
-            self.report_mouse(
-                GHOSTTY_MOUSE_ACTION_RELEASE,
-                Some(button),
-                event.position,
-                &event.modifiers,
-            );
+        let button = keys::mouse_button(event.button);
+        if self.reported_button == Some(button) {
+            self.reported_button = None;
+            self.report_mouse(MouseAction::Release, Some(button), event.position, &event.modifiers);
             return;
         }
         if self.selecting && event.button == MouseButton::Left {
             self.selecting = false;
-            let grid_ref = self.gesture_point(event.position).map(|p| p.grid_ref);
-            self.gesture.release(&self.terminal, grid_ref);
+            let point = self.layout.map(|layout| layout.gesture_point(event.position));
+            self.terminal.selection_release(point.as_ref());
             cx.notify();
         }
     }
@@ -830,72 +723,28 @@ impl TerminalView {
 
         if self.reports_mouse(event.modifiers.shift) {
             let button = if up {
-                GHOSTTY_MOUSE_BUTTON_FOUR
+                vt::MouseButton::Four
             } else {
-                GHOSTTY_MOUSE_BUTTON_FIVE
+                vt::MouseButton::Five
             };
             for _ in 0..count {
-                self.report_mouse(
-                    GHOSTTY_MOUSE_ACTION_PRESS,
-                    Some(button),
-                    event.position,
-                    &event.modifiers,
-                );
+                self.report_mouse(MouseAction::Press, Some(button), event.position, &event.modifiers);
             }
         } else if self.terminal.alternate_screen() && self.terminal.dec_mode(MODE_ALTERNATE_SCROLL)
         {
             // Full-screen programs without mouse support (less, man) get
             // arrow keys instead.
-            let input = KeyInput {
-                action: GHOSTTY_KEY_ACTION_PRESS,
-                key: if up {
-                    GHOSTTY_KEY_ARROW_UP
-                } else {
-                    GHOSTTY_KEY_ARROW_DOWN
-                },
-                mods: 0,
-                text: "",
-                unshifted: None,
-            };
+            let input = keys::arrow(up);
             let mut out = Vec::new();
             for _ in 0..count {
                 self.key_encoder.encode(&self.terminal, &input, &mut out);
             }
-            if let Some(pty) = &self.pty {
-                pty.write(out);
-            }
+            self.write_to_pty(out);
         } else {
             let rows = count as isize;
             self.terminal.scroll_by(if up { -rows } else { rows });
             cx.notify();
         }
-    }
-
-    // ---- IME --------------------------------------------------------------
-
-    fn utf16_len(text: &str) -> usize {
-        text.encode_utf16().count()
-    }
-
-    fn byte_offset(text: &str, utf16: usize) -> usize {
-        let mut units = 0;
-        for (offset, c) in text.char_indices() {
-            if units >= utf16 {
-                return offset;
-            }
-            units += c.len_utf16();
-        }
-        text.len()
-    }
-}
-
-fn ghostty_button(button: MouseButton) -> GhosttyMouseButton {
-    match button {
-        MouseButton::Left => GHOSTTY_MOUSE_BUTTON_LEFT,
-        MouseButton::Right => GHOSTTY_MOUSE_BUTTON_RIGHT,
-        MouseButton::Middle => GHOSTTY_MOUSE_BUTTON_MIDDLE,
-        MouseButton::Navigate(gpui::NavigationDirection::Back) => GHOSTTY_MOUSE_BUTTON_FOUR,
-        MouseButton::Navigate(gpui::NavigationDirection::Forward) => GHOSTTY_MOUSE_BUTTON_FIVE,
     }
 }
 
@@ -907,12 +756,11 @@ impl EntityInputHandler for TerminalView {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<String> {
-        let start = Self::byte_offset(&self.marked_text, range.start);
-        let end = Self::byte_offset(&self.marked_text, range.end);
-        adjusted_range.replace(
-            Self::utf16_len(&self.marked_text[..start])..Self::utf16_len(&self.marked_text[..end]),
-        );
-        Some(self.marked_text[start..end].to_owned())
+        let text = &self.composition.text;
+        let start = utf16::to_byte(text, range.start);
+        let end = utf16::to_byte(text, range.end);
+        adjusted_range.replace(utf16::from_byte(text, start)..utf16::from_byte(text, end));
+        Some(text[start..end].to_owned())
     }
 
     fn selected_text_range(
@@ -921,19 +769,19 @@ impl EntityInputHandler for TerminalView {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
-        let end = Self::utf16_len(&self.marked_text);
         Some(UTF16Selection {
-            range: end..end,
+            range: self.composition.selected.clone(),
             reversed: false,
         })
     }
 
     fn marked_text_range(&self, _window: &mut Window, _cx: &mut Context<Self>) -> Option<Range<usize>> {
-        (!self.marked_text.is_empty()).then(|| 0..Self::utf16_len(&self.marked_text))
+        let text = &self.composition.text;
+        (!text.is_empty()).then(|| 0..utf16::len(text))
     }
 
     fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        self.marked_text.clear();
+        self.composition = Composition::default();
         cx.notify();
     }
 
@@ -946,21 +794,38 @@ impl EntityInputHandler for TerminalView {
     ) {
         // Committed text (typed characters or an IME result) goes to the
         // program verbatim.
-        self.marked_text.clear();
+        self.composition = Composition::default();
         self.send_user_input(text.as_bytes().to_vec(), cx);
         cx.notify();
     }
 
     fn replace_and_mark_text_in_range(
         &mut self,
-        _range: Option<Range<usize>>,
+        range: Option<Range<usize>>,
         new_text: &str,
-        _new_selected_range: Option<Range<usize>>,
+        new_selected_range: Option<Range<usize>>,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.marked_text.clear();
-        self.marked_text.push_str(new_text);
+        // Without a range the whole composition is replaced.
+        let composition = &mut self.composition;
+        let replaced = match range {
+            Some(range) => {
+                utf16::to_byte(&composition.text, range.start)
+                    ..utf16::to_byte(&composition.text, range.end)
+            }
+            None => 0..composition.text.len(),
+        };
+        composition.text.replace_range(replaced.clone(), new_text);
+        // The new selection is relative to the inserted text.
+        let start = utf16::from_byte(&composition.text, replaced.start);
+        composition.selected = match new_selected_range {
+            Some(selected) => start + selected.start..start + selected.end,
+            None => {
+                let end = start + utf16::len(new_text);
+                end..end
+            }
+        };
         cx.notify();
     }
 
@@ -974,11 +839,7 @@ impl EntityInputHandler for TerminalView {
         // Anchor the IME candidate window at the cursor cell.
         let layout = self.layout?;
         let cursor = self.frame.cursor?;
-        let origin = layout.grid_origin()
-            + point(
-                layout.cell_width * (cursor.x as f32 + range.start as f32),
-                layout.line_height * cursor.y as f32,
-            );
+        let origin = layout.cell_origin(cursor.x as f32 + range.start as f32, cursor.y as f32);
         Some(Bounds::new(origin, size(layout.cell_width, layout.line_height)))
     }
 
@@ -1002,7 +863,7 @@ impl Focusable for TerminalView {
 
 impl Render for TerminalView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
+        let mut root = div()
             .id("terminal")
             .key_context(KEY_CONTEXT)
             .track_focus(&self.focus_handle)
@@ -1023,15 +884,15 @@ impl Render for TerminalView {
             .on_key_down(cx.listener(Self::key_down))
             .on_key_up(cx.listener(Self::key_up))
             .on_modifiers_changed(cx.listener(Self::modifiers_changed))
-            .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
-            .on_mouse_down(MouseButton::Right, cx.listener(Self::mouse_down))
-            .on_mouse_down(MouseButton::Middle, cx.listener(Self::mouse_down))
-            .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
-            .on_mouse_up(MouseButton::Right, cx.listener(Self::mouse_up))
-            .on_mouse_up(MouseButton::Middle, cx.listener(Self::mouse_up))
-            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::mouse_up))
-            .on_scroll_wheel(cx.listener(Self::scroll_wheel))
-            .child(TerminalElement::new(cx.entity()))
+            .on_scroll_wheel(cx.listener(Self::scroll_wheel));
+        // Releases outside the terminal end drags and reported presses too.
+        for button in MOUSE_BUTTONS {
+            root = root
+                .on_mouse_down(button, cx.listener(Self::mouse_down))
+                .on_mouse_up(button, cx.listener(Self::mouse_up))
+                .on_mouse_up_out(button, cx.listener(Self::mouse_up));
+        }
+        root.child(TerminalElement::new(cx.entity()))
     }
 }
 
@@ -1115,63 +976,5 @@ impl gpui::InputHandler for TerminalInputHandler {
 
     fn apple_press_and_hold_enabled(&mut self) -> bool {
         false
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn layout() -> GridLayout {
-        GridLayout {
-            bounds: Bounds::new(point(px(0.), px(40.)), size(px(800.), px(500.))),
-            cell_width: px(8.),
-            line_height: px(16.),
-            cols: 97,
-            rows: 30,
-            scale: 2.,
-        }
-    }
-
-    fn bar(offset: u64) -> Scrollbar {
-        Scrollbar {
-            total: 1000,
-            offset,
-            len: 30,
-        }
-    }
-
-    #[test]
-    fn thumb_spans_track_ends() {
-        let layout = layout();
-        let track = layout.scrollbar_track();
-        let top = layout.scrollbar_thumb(bar(0)).unwrap();
-        let bottom = layout.scrollbar_thumb(bar(970)).unwrap();
-        assert_eq!(top.top(), track.top());
-        assert_eq!(bottom.bottom(), track.bottom());
-        // 30 of 1000 rows would be 15px: clamped to the minimum.
-        assert_eq!(top.size.height, MIN_THUMB_HEIGHT);
-    }
-
-    #[test]
-    fn dragging_thumb_round_trips_offset() {
-        let layout = layout();
-        for offset in [0, 1, 485, 969, 970] {
-            let thumb = layout.scrollbar_thumb(bar(offset)).unwrap();
-            assert_eq!(layout.scrollbar_offset_at(bar(offset), thumb.top()), offset);
-        }
-        // Dragging past either end clamps.
-        assert_eq!(layout.scrollbar_offset_at(bar(500), px(-100.)), 0);
-        assert_eq!(layout.scrollbar_offset_at(bar(500), px(10_000.)), 970);
-    }
-
-    #[test]
-    fn no_thumb_without_scrollback() {
-        let screen = Scrollbar {
-            total: 30,
-            offset: 0,
-            len: 30,
-        };
-        assert!(layout().scrollbar_thumb(screen).is_none());
     }
 }

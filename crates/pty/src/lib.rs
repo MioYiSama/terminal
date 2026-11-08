@@ -54,6 +54,11 @@ impl Command {
         }
     }
 
+    /// The program that runs, with the default shell resolved.
+    pub fn program(&self) -> OsString {
+        self.program.clone().unwrap_or_else(sys::default_shell)
+    }
+
     pub fn arg(&mut self, arg: impl Into<OsString>) -> &mut Self {
         self.args.push(arg.into());
         self

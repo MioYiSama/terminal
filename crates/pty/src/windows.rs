@@ -195,7 +195,7 @@ fn wide(s: &OsStr) -> Vec<u16> {
 }
 
 fn command_line(cmd: &Command) -> Vec<u16> {
-    let program = cmd.program.clone().unwrap_or_else(default_shell);
+    let program = cmd.program();
     let mut line = Vec::new();
     for (i, arg) in [&program].into_iter().chain(&cmd.args).enumerate() {
         if i > 0 {
@@ -209,7 +209,7 @@ fn command_line(cmd: &Command) -> Vec<u16> {
 
 /// PowerShell 7 (`pwsh.exe`), then Windows PowerShell (`powershell.exe`), as
 /// found on `PATH`; otherwise `%ComSpec%` or `cmd.exe`.
-fn default_shell() -> OsString {
+pub(crate) fn default_shell() -> OsString {
     ["pwsh.exe", "powershell.exe"]
         .into_iter()
         .find_map(find_on_path)

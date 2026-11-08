@@ -5,7 +5,6 @@ use std::fmt::Write;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
-use crate::pty::home_dir;
 use crate::vt::{Frame, Terminal};
 
 /// A link on screen and the cells showing it.
@@ -126,7 +125,7 @@ impl<'a> LogicalLine<'a> {
 const SCHEMES: [&str; 5] = ["https://", "http://", "file://", "ftp://", "mailto:"];
 
 /// The byte range of the URL in `text` covering byte `at`, if any.
-pub fn url_at(text: &str, at: usize) -> Option<Range<usize>> {
+fn url_at(text: &str, at: usize) -> Option<Range<usize>> {
     let mut search = 0;
     while let Some((start, scheme)) = SCHEMES
         .iter()
@@ -207,7 +206,7 @@ fn strip_location(mut path: &str) -> &str {
 /// directory and relative paths taken from `cwd`.
 fn resolve(path: &str, cwd: impl FnOnce() -> Option<PathBuf>) -> Option<PathBuf> {
     let path = match path.strip_prefix("~/") {
-        Some(rest) => home_dir()?.join(rest),
+        Some(rest) => dirs::home_dir()?.join(rest),
         None => PathBuf::from(path),
     };
     let path = if path.is_absolute() { path } else { cwd()?.join(path) };

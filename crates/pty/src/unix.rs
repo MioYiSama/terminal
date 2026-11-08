@@ -179,7 +179,7 @@ fn spawn_child(cmd: &Command, slave: File) -> io::Result<process::Child> {
     command.spawn()
 }
 
-fn default_shell() -> OsString {
+pub(crate) fn default_shell() -> OsString {
     env::var_os("SHELL")
         .filter(|shell| !shell.is_empty())
         .or_else(passwd_shell)

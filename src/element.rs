@@ -16,7 +16,8 @@ use gpui::{
 
 use crate::box_drawing;
 use crate::links::Link;
-use crate::view::{GridLayout, PADDING, SCROLLBAR_WIDTH, TerminalInputHandler, TerminalView};
+use crate::grid::{GridLayout, PADDING, SCROLLBAR_WIDTH};
+use crate::view::{TerminalInputHandler, TerminalView};
 use crate::vt::{CursorShape, Frame, ImageLayer, ImagePlacement, Rgb, Underline};
 
 pub struct TerminalElement {
@@ -58,30 +59,82 @@ struct RowGlyphs {
     colors: Vec<Hsla>,
 }
 
-pub struct Prepared {
-    layout: GridLayout,
+/// Font metrics of the grid's rows, snapped to device pixels.
+#[derive(Clone, Copy)]
+struct Metrics {
     font_size: Pixels,
+    ascent: Pixels,
+    cell_width: Pixels,
+    line_height: Pixels,
+    /// Offset of the baseline within a row.
     baseline: Pixels,
-    background: Hsla,
+    /// Thickness of underlines and other strokes.
+    thickness: Pixels,
+    /// Offset of underlines within a row.
+    underline_y: Pixels,
+}
+
+impl Metrics {
+    fn new(font: &gpui::Font, font_size: Pixels, window: &Window) -> Self {
+        let text_system = window.text_system();
+        let scale = window.scale_factor();
+        let font_id = text_system.resolve_font(font);
+        let advance = text_system
+            .advance(font_id, font_size, 'M')
+            .map(|advance| advance.width)
+            .unwrap_or(font_size * 0.6);
+        let ascent = text_system.ascent(font_id, font_size);
+        // The sign of the reported descent differs by platform (negative on
+        // macOS and Windows, positive on Linux); only its size counts.
+        let descent = text_system.descent(font_id, font_size).abs();
+        let line_height = snap((ascent + descent).max(font_size * 1.2), scale);
+        // Center the font's ascent + descent box in the cell. GPUI's
+        // `baseline_offset` assumes a positive descent, so it is not used.
+        let baseline = snap((line_height - ascent - descent) / 2. + ascent, scale);
+        let thickness = px((f32::from(font_size) / 14.).round().max(1.));
+        Self {
+            font_size,
+            ascent,
+            cell_width: snap(advance, scale),
+            line_height,
+            baseline,
+            thickness,
+            underline_y: (baseline + descent * 0.5).min(line_height - thickness),
+        }
+    }
+}
+
+/// Cell contents: everything that changes with the terminal's text.
+struct Cells {
     backgrounds: Vec<PaintQuad>,
     rows: Vec<RowGlyphs>,
     /// Row, column and scalar of cell-filling procedural symbols.
     symbols: Vec<(usize, u16, char)>,
     decorations: Vec<PaintQuad>,
+}
+
+/// The cursor, or the IME composition shown in its place.
+#[derive(Default)]
+struct CursorDraw {
     /// Filled block cursor, painted beneath the text.
-    cursor_block: Option<PaintQuad>,
+    block: Option<PaintQuad>,
     /// Bar, underline or hollow cursor, painted above the text.
-    cursor_overlay: Option<PaintQuad>,
+    overlay: Option<PaintQuad>,
     /// Cell whose glyph is drawn in a contrasting color under a block cursor.
-    cursor_text: Option<(usize, u16, Hsla)>,
+    text: Option<(usize, u16, Hsla)>,
     marked: Option<(Point<Pixels>, ShapedLine, PaintQuad)>,
+}
+
+pub struct Prepared {
+    layout: GridLayout,
+    metrics: Metrics,
+    background: Hsla,
+    cells: Cells,
+    cursor: CursorDraw,
     /// Scrollbar thumb, and the track's hitbox for the arrow cursor.
     scrollbar: Option<(PaintQuad, Hitbox)>,
     /// Kitty graphics, sorted by layer and then z-index.
     images: Vec<ImageDraw>,
-    /// Offset and thickness of underlines within a row.
-    underline_y: Pixels,
-    thickness: Pixels,
     link: Option<LinkDraw>,
 }
 
@@ -102,17 +155,16 @@ fn link_draw(
     window: &mut Window,
 ) -> LinkDraw {
     let layout = prepared.layout;
-    let origin = layout.bounds.origin + point(PADDING, PADDING);
     let (cw, lh) = (layout.cell_width, layout.line_height);
     let underlines = link
         .spans
         .iter()
         .map(|(row, cols)| {
-            let top = origin.y + lh * *row as f32 + prepared.underline_y;
+            let start = layout.cell_origin(cols.start as f32, *row as f32);
             fill(
                 Bounds::new(
-                    point(origin.x + cw * cols.start as f32, top),
-                    size(cw * cols.len() as f32, prepared.thickness),
+                    start + point(px(0.), prepared.metrics.underline_y),
+                    size(cw * cols.len() as f32, prepared.metrics.thickness),
                 ),
                 foreground,
             )
@@ -138,14 +190,14 @@ fn link_draw(
     };
     let line = window
         .text_system()
-        .shape_line(text, prepared.font_size, &[run], None);
+        .shape_line(text, prepared.metrics.font_size, &[run], None);
     let pad = cw / 2.;
     let chip = size(line.width + pad * 2., lh);
     // Bottom-left, or bottom-right when that would cover the link itself.
     let bottom = layout.bounds.bottom() - PADDING - chip.height;
     let left = layout.bounds.left() + PADDING;
     let covers_link = link.spans.iter().any(|(row, cols)| {
-        *row + 1 >= layout.rows && origin.x + cw * cols.start as f32 <= left + chip.width
+        *row + 1 >= layout.rows && layout.cell_origin(cols.start as f32, 0.).x <= left + chip.width
     });
     let x = if covers_link {
         layout.bounds.right() - PADDING - SCROLLBAR_WIDTH - chip.width
@@ -178,14 +230,7 @@ fn image_draws(
     mut placements: Vec<(ImagePlacement, Arc<RenderImage>)>,
 ) -> Vec<ImageDraw> {
     placements.sort_by_key(|(p, _)| (p.layer, p.z));
-    let origin = layout.bounds.origin + point(PADDING, PADDING);
-    let grid = Bounds::new(
-        origin,
-        size(
-            layout.cell_width * layout.cols as f32,
-            layout.line_height * layout.rows as f32,
-        ),
-    );
+    let grid = layout.grid_bounds();
     placements
         .into_iter()
         .filter_map(|(p, image)| {
@@ -193,11 +238,8 @@ fn image_draws(
                 return None;
             }
             let dest = Bounds::new(
-                origin
-                    + point(
-                        layout.cell_width * p.col as f32 + layout.logical(p.offset_x as f32),
-                        layout.line_height * p.row as f32 + layout.logical(p.offset_y as f32),
-                    ),
+                layout.cell_origin(p.col as f32, p.row as f32)
+                    + point(layout.logical(p.offset_x as f32), layout.logical(p.offset_y as f32)),
                 size(layout.logical(p.width as f32), layout.logical(p.height as f32)),
             );
             let clip = dest.intersect(&grid);
@@ -274,37 +316,14 @@ impl Element for TerminalElement {
         cx: &mut App,
     ) -> Self::PrepaintState {
         self.view.update(cx, |view, cx| {
-            let text_system = window.text_system().clone();
-            let scale = window.scale_factor();
             let font = view.font();
-            let font_size = view.font_size();
-            let font_id = text_system.resolve_font(&font);
-
-            let advance = text_system
-                .advance(font_id, font_size, 'M')
-                .map(|advance| advance.width)
-                .unwrap_or(font_size * 0.6);
-            let ascent = text_system.ascent(font_id, font_size);
-            // The sign of the reported descent differs by platform (negative
-            // on macOS and Windows, positive on Linux); only its size counts.
-            let descent = text_system.descent(font_id, font_size).abs();
-            let cell_width = snap(advance, scale);
-            let line_height = snap((ascent + descent).max(font_size * 1.2), scale);
-            // Center the font's ascent + descent box in the cell. GPUI's
-            // `baseline_offset` assumes a positive descent, so it is not used.
-            let baseline = snap((line_height - ascent - descent) / 2. + ascent, scale);
-
-            let inner = bounds.size - size(PADDING * 2. + SCROLLBAR_WIDTH, PADDING * 2.);
-            let cols = (f32::from(inner.width) / f32::from(cell_width)).floor().max(1.) as u16;
-            let rows = (f32::from(inner.height) / f32::from(line_height)).floor().max(1.) as u16;
-            let layout = GridLayout {
+            let metrics = Metrics::new(&font, view.font_size(), window);
+            let layout = GridLayout::fit(
                 bounds,
-                cell_width,
-                line_height,
-                cols,
-                rows,
-                scale,
-            };
+                metrics.cell_width,
+                metrics.line_height,
+                window.scale_factor(),
+            );
             view.set_layout(layout);
 
             let focused = view.is_focused(window);
@@ -317,18 +336,16 @@ impl Element for TerminalElement {
             ];
             let frame = view.snapshot(cx);
             let foreground = hsla(frame.foreground);
-            let mut prepared = build(
-                frame,
+            let mut prepared = Prepared {
                 layout,
-                &fonts,
-                font_size,
-                baseline,
-                ascent,
-                descent,
-                focused,
-                marked_text,
-                window,
-            );
+                metrics,
+                background: hsla(frame.background),
+                cells: build_cells(frame, layout, &fonts, &metrics, window),
+                cursor: build_cursor(frame, layout, &fonts, &metrics, focused, marked_text, window),
+                scrollbar: None,
+                images: Vec::new(),
+                link: None,
+            };
             prepared.images = image_draws(layout, view.images(window));
             let clickable = view.link_clickable();
             prepared.link = view
@@ -386,90 +403,25 @@ impl Element for TerminalElement {
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
             window.paint_quad(fill(bounds, prepared.background));
             paint_images(&prepared.images, ImageLayer::BelowBackground, window);
-            for quad in prepared.backgrounds.drain(..) {
+            for quad in prepared.cells.backgrounds.drain(..) {
                 window.paint_quad(quad);
             }
             paint_images(&prepared.images, ImageLayer::BelowText, window);
-            if let Some(quad) = prepared.cursor_block.take() {
+            if let Some(quad) = prepared.cursor.block.take() {
                 window.paint_quad(quad);
             }
-
-            let layout = prepared.layout;
-            let origin = bounds.origin + point(PADDING, PADDING);
-            for (row_index, row) in prepared.rows.iter().enumerate() {
-                let y = origin.y + layout.line_height * row_index as f32 + prepared.baseline;
-                let mut cluster_column = NO_COLUMN;
-                let mut cluster_x = px(0.);
-                for run in row.line.runs.iter() {
-                    for glyph in &run.glyphs {
-                        let column = row.byte_columns.get(glyph.index).copied().unwrap_or(NO_COLUMN);
-                        if column == NO_COLUMN {
-                            continue;
-                        }
-                        // Glyphs of one cell keep their relative offsets
-                        // (combining marks, multi-glyph clusters).
-                        if column != cluster_column {
-                            cluster_column = column;
-                            cluster_x = glyph.position.x;
-                        }
-                        let x = origin.x
-                            + layout.cell_width * column as f32
-                            + (glyph.position.x - cluster_x);
-                        let glyph_origin = point(x, y);
-                        if glyph.is_emoji {
-                            let _ = window.paint_emoji(
-                                glyph_origin,
-                                run.font_id,
-                                glyph.id,
-                                prepared.font_size,
-                            );
-                        } else {
-                            let color = match prepared.cursor_text {
-                                Some((r, c, color)) if r == row_index && c == column => color,
-                                _ => row.colors[column as usize],
-                            };
-                            let _ = window.paint_glyph(
-                                glyph_origin,
-                                run.font_id,
-                                glyph.id,
-                                prepared.font_size,
-                                color,
-                            );
-                        }
-                    }
-                }
-            }
-
-            for &(row, column, ch) in &prepared.symbols {
-                let color = match prepared.cursor_text {
-                    Some((r, c, color)) if r == row && c == column => color,
-                    _ => prepared.rows[row].colors[column as usize],
-                };
-                box_drawing::paint(
-                    ch,
-                    Bounds::new(
-                        origin + point(
-                            layout.cell_width * column as f32,
-                            layout.line_height * row as f32,
-                        ),
-                        size(layout.cell_width, layout.line_height),
-                    ),
-                    prepared.font_size,
-                    color,
-                    window,
-                );
-            }
-
-            for quad in prepared.decorations.drain(..) {
+            paint_text(prepared, window);
+            for quad in prepared.cells.decorations.drain(..) {
                 window.paint_quad(quad);
             }
             paint_images(&prepared.images, ImageLayer::AboveText, window);
-            if let Some(quad) = prepared.cursor_overlay.take() {
+            if let Some(quad) = prepared.cursor.overlay.take() {
                 window.paint_quad(quad);
             }
-            if let Some((position, line, background)) = prepared.marked.take() {
+            let line_height = prepared.layout.line_height;
+            if let Some((position, line, background)) = prepared.cursor.marked.take() {
                 window.paint_quad(background);
-                let _ = line.paint(position, layout.line_height, window, cx);
+                let _ = line.paint(position, line_height, window, cx);
             }
             if let Some(link) = prepared.link.take() {
                 for quad in link.underlines {
@@ -477,7 +429,7 @@ impl Element for TerminalElement {
                 }
                 let (position, line, background) = link.preview;
                 window.paint_quad(background);
-                let _ = line.paint(position, layout.line_height, window, cx);
+                let _ = line.paint(position, line_height, window, cx);
                 if let Some(hitbox) = &link.hitbox {
                     window.set_cursor_style(CursorStyle::PointingHand, hitbox);
                 }
@@ -490,26 +442,69 @@ impl Element for TerminalElement {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn build(
+/// Paint the glyphs of the rows and the procedural symbols, each at its
+/// cell.
+fn paint_text(prepared: &Prepared, window: &mut Window) {
+    let layout = prepared.layout;
+    let font_size = prepared.metrics.font_size;
+    let color_at = |row: usize, column: u16| match prepared.cursor.text {
+        Some((r, c, color)) if r == row && c == column => color,
+        _ => prepared.cells.rows[row].colors[column as usize],
+    };
+    for (row_index, row) in prepared.cells.rows.iter().enumerate() {
+        let y = layout.cell_origin(0., row_index as f32).y + prepared.metrics.baseline;
+        let mut cluster_column = NO_COLUMN;
+        let mut cluster_x = px(0.);
+        for run in row.line.runs.iter() {
+            for glyph in &run.glyphs {
+                let column = row.byte_columns.get(glyph.index).copied().unwrap_or(NO_COLUMN);
+                if column == NO_COLUMN {
+                    continue;
+                }
+                // Glyphs of one cell keep their relative offsets (combining
+                // marks, multi-glyph clusters).
+                if column != cluster_column {
+                    cluster_column = column;
+                    cluster_x = glyph.position.x;
+                }
+                let x = layout.cell_origin(column as f32, 0.).x + (glyph.position.x - cluster_x);
+                let glyph_origin = point(x, y);
+                if glyph.is_emoji {
+                    let _ = window.paint_emoji(glyph_origin, run.font_id, glyph.id, font_size);
+                } else {
+                    let color = color_at(row_index, column);
+                    let _ = window.paint_glyph(glyph_origin, run.font_id, glyph.id, font_size, color);
+                }
+            }
+        }
+    }
+
+    for &(row, column, ch) in &prepared.cells.symbols {
+        let cell = Bounds::new(
+            layout.cell_origin(column as f32, row as f32),
+            size(layout.cell_width, layout.line_height),
+        );
+        box_drawing::paint(ch, cell, font_size, color_at(row, column), window);
+    }
+}
+
+/// Shape the rows' text and lay out cell backgrounds and decorations.
+fn build_cells(
     frame: &Frame,
     layout: GridLayout,
     fonts: &[gpui::Font; 4],
-    font_size: Pixels,
-    baseline: Pixels,
-    ascent: Pixels,
-    descent: Pixels,
-    focused: bool,
-    marked_text: SharedString,
+    metrics: &Metrics,
     window: &mut Window,
-) -> Prepared {
-    let origin = layout.bounds.origin + point(PADDING, PADDING);
+) -> Cells {
     let cw = layout.cell_width;
     let lh = layout.line_height;
-    let background = hsla(frame.background);
-    let thickness = px((f32::from(font_size) / 14.).round().max(1.));
-    let underline_y = (baseline + descent * 0.5).min(lh - thickness);
-    let strike_y = baseline - ascent * 0.3;
+    let Metrics {
+        thickness,
+        underline_y,
+        baseline,
+        ..
+    } = *metrics;
+    let strike_y = baseline - metrics.ascent * 0.3;
 
     let mut backgrounds = Vec::new();
     let mut decorations = Vec::new();
@@ -517,7 +512,7 @@ fn build(
     let mut symbols = Vec::new();
 
     for (row_index, line) in frame.lines.iter().enumerate() {
-        let top = origin.y + lh * row_index as f32;
+        let row_origin = layout.cell_origin(0., row_index as f32);
 
         // Cell backgrounds, merging horizontal runs of the same color.
         let mut run: Option<(usize, usize, Rgb)> = None;
@@ -525,7 +520,7 @@ fn build(
             if let Some((start, end, color)) = run {
                 backgrounds.push(fill(
                     Bounds::new(
-                        point(origin.x + cw * start as f32, top),
+                        row_origin + point(cw * start as f32, px(0.)),
                         size(cw * (end - start) as f32, lh),
                     ),
                     hsla(color),
@@ -559,11 +554,11 @@ fn build(
             colors.push(fg);
 
             let width = if cell.wide { 2. } else { 1. };
-            let x = origin.x + cw * col as f32;
+            let cell_origin = row_origin + point(cw * col as f32, px(0.));
             let deco_color = cell.underline_color.map(hsla).unwrap_or(fg);
             let mut line_at = |y: Pixels, color: Hsla| {
                 decorations.push(fill(
-                    Bounds::new(point(x, top + y), size(cw * width, thickness)),
+                    Bounds::new(cell_origin + point(px(0.), y), size(cw * width, thickness)),
                     color,
                 ));
             };
@@ -608,7 +603,7 @@ fn build(
 
         let line = window
             .text_system()
-            .shape_line(text.into(), font_size, &runs, None);
+            .shape_line(text.into(), metrics.font_size, &runs, None);
         rows.push(RowGlyphs {
             line,
             byte_columns,
@@ -616,91 +611,91 @@ fn build(
         });
     }
 
-    // Cursor. Hidden while the IME shows composition text in its place.
-    let mut cursor_block = None;
-    let mut cursor_overlay = None;
-    let mut cursor_text = None;
-    let mut marked = None;
-    if let Some(cursor) = frame.cursor {
-        let cell_origin = point(origin.x + cw * cursor.x as f32, origin.y + lh * cursor.y as f32);
-        let width = cw * if cursor.wide { 2. } else { 1. };
-        let color = hsla(cursor.color);
-        if !marked_text.is_empty() {
-            let run = TextRun {
-                len: marked_text.len(),
-                font: fonts[0].clone(),
-                color: hsla(frame.foreground),
-                background_color: None,
-                underline: Some(UnderlineStyle {
-                    color: Some(hsla(frame.foreground)),
-                    thickness: px(1.),
-                    wavy: false,
-                }),
-                strikethrough: None,
-            };
-            let line = window
-                .text_system()
-                .shape_line(marked_text, font_size, &[run], None);
-            let background_quad = fill(Bounds::new(cell_origin, size(line.width, lh)), background);
-            marked = Some((cell_origin, line, background_quad));
-        } else {
-            let shape = if focused {
-                cursor.shape
-            } else {
-                CursorShape::HollowBlock
-            };
-            match shape {
-                CursorShape::Block => {
-                    cursor_block = Some(fill(Bounds::new(cell_origin, size(width, lh)), color));
-                    let under = frame
-                        .lines
-                        .get(cursor.y as usize)
-                        .and_then(|line| line.cells.get(cursor.x as usize))
-                        .and_then(|cell| cell.bg)
-                        .unwrap_or(frame.background);
-                    cursor_text = Some((cursor.y as usize, cursor.x, hsla(under)));
-                }
-                CursorShape::HollowBlock => {
-                    cursor_overlay = Some(outline(
-                        Bounds::new(cell_origin, size(width, lh)),
-                        color,
-                        BorderStyle::Solid,
-                    ));
-                }
-                CursorShape::Bar => {
-                    let bar = px(f32::from(thickness).max(2.));
-                    cursor_overlay = Some(fill(Bounds::new(cell_origin, size(bar, lh)), color));
-                }
-                CursorShape::Underline => {
-                    let bar = px(f32::from(thickness).max(2.));
-                    cursor_overlay = Some(fill(
-                        Bounds::new(cell_origin + point(px(0.), lh - bar), size(width, bar)),
-                        color,
-                    ));
-                }
-            }
-        }
-    }
-
-    Prepared {
-        layout,
-        font_size,
-        baseline,
-        background,
+    Cells {
         backgrounds,
         rows,
         symbols,
         decorations,
-        cursor_block,
-        cursor_overlay,
-        cursor_text,
-        marked,
-        scrollbar: None,
-        images: Vec::new(),
-        underline_y,
-        thickness,
-        link: None,
     }
+}
+
+/// The cursor in its shape, hollow when unfocused; hidden while the IME
+/// shows composition text in its place.
+fn build_cursor(
+    frame: &Frame,
+    layout: GridLayout,
+    fonts: &[gpui::Font; 4],
+    metrics: &Metrics,
+    focused: bool,
+    marked_text: SharedString,
+    window: &mut Window,
+) -> CursorDraw {
+    let Some(cursor) = frame.cursor else {
+        return CursorDraw::default();
+    };
+    let lh = layout.line_height;
+    let cell_origin = layout.cell_origin(cursor.x as f32, cursor.y as f32);
+    let width = layout.cell_width * if cursor.wide { 2. } else { 1. };
+    let color = hsla(cursor.color);
+    let mut draw = CursorDraw::default();
+
+    if !marked_text.is_empty() {
+        let foreground = hsla(frame.foreground);
+        let run = TextRun {
+            len: marked_text.len(),
+            font: fonts[0].clone(),
+            color: foreground,
+            background_color: None,
+            underline: Some(UnderlineStyle {
+                color: Some(foreground),
+                thickness: px(1.),
+                wavy: false,
+            }),
+            strikethrough: None,
+        };
+        let line = window
+            .text_system()
+            .shape_line(marked_text, metrics.font_size, &[run], None);
+        let background = fill(Bounds::new(cell_origin, size(line.width, lh)), hsla(frame.background));
+        draw.marked = Some((cell_origin, line, background));
+        return draw;
+    }
+
+    let shape = if focused {
+        cursor.shape
+    } else {
+        CursorShape::HollowBlock
+    };
+    let bar = px(f32::from(metrics.thickness).max(2.));
+    match shape {
+        CursorShape::Block => {
+            draw.block = Some(fill(Bounds::new(cell_origin, size(width, lh)), color));
+            let under = frame
+                .lines
+                .get(cursor.y as usize)
+                .and_then(|line| line.cells.get(cursor.x as usize))
+                .and_then(|cell| cell.bg)
+                .unwrap_or(frame.background);
+            draw.text = Some((cursor.y as usize, cursor.x, hsla(under)));
+        }
+        CursorShape::HollowBlock => {
+            draw.overlay = Some(outline(
+                Bounds::new(cell_origin, size(width, lh)),
+                color,
+                BorderStyle::Solid,
+            ));
+        }
+        CursorShape::Bar => {
+            draw.overlay = Some(fill(Bounds::new(cell_origin, size(bar, lh)), color));
+        }
+        CursorShape::Underline => {
+            draw.overlay = Some(fill(
+                Bounds::new(cell_origin + point(px(0.), lh - bar), size(width, bar)),
+                color,
+            ));
+        }
+    }
+    draw
 }
 
 fn push_run(runs: &mut Vec<TextRun>, fonts: &[gpui::Font; 4], variant: usize, len: usize) {

@@ -1,13 +1,13 @@
-//! Translate GPUI keystrokes into libghostty key events.
+//! Translate GPUI keyboard and mouse input into libghostty's vocabulary.
 
 use ghostty_sys::*;
-use gpui::{Keystroke, Modifiers};
+use gpui::{Keystroke, Modifiers, NavigationDirection};
 
-use crate::vt::KeyInput;
+use crate::vt::{KeyAction, KeyInput, MouseButton};
 
 /// Map GPUI's logical key name to the physical key libghostty expects. GPUI
 /// reports the US-layout character for letter/digit/punctuation keys.
-pub fn ghostty_key(key: &str) -> GhosttyKey {
+fn ghostty_key(key: &str) -> GhosttyKey {
     let mut chars = key.chars();
     if let (Some(c), None) = (chars.next(), chars.clone().next()) {
         return match c {
@@ -168,12 +168,13 @@ pub fn encodable<'a>(keystroke: &'a Keystroke, owned_text: &'a mut String) -> Op
         ""
     } else if m.alt || m.control {
         owned_text.clear();
-        if let Some(c) = unshifted {
-            if m.shift {
-                owned_text.extend(c.to_uppercase());
-            } else {
-                owned_text.push(c);
-            }
+        match unshifted {
+            Some(c) if m.shift => match shifted_symbol(c) {
+                Some(symbol) => owned_text.push(symbol),
+                None => owned_text.extend(c.to_uppercase()),
+            },
+            Some(c) => owned_text.push(c),
+            None => {}
         }
         let owned_text: &'a String = owned_text;
         owned_text.as_str()
@@ -182,10 +183,65 @@ pub fn encodable<'a>(keystroke: &'a Keystroke, owned_text: &'a mut String) -> Op
     };
 
     Some(KeyInput {
-        action: GHOSTTY_KEY_ACTION_PRESS,
+        action: KeyAction::Press,
         key: ghostty_key(key),
         mods: ghostty_mods(m),
         text,
         unshifted,
     })
+}
+
+/// The symbol Shift turns US-layout digit or punctuation key `c` into, as
+/// GPUI names those keys by their unshifted character. Letters are
+/// uppercased instead.
+fn shifted_symbol(c: char) -> Option<char> {
+    Some(match c {
+        '1' => '!',
+        '2' => '@',
+        '3' => '#',
+        '4' => '$',
+        '5' => '%',
+        '6' => '^',
+        '7' => '&',
+        '8' => '*',
+        '9' => '(',
+        '0' => ')',
+        '`' => '~',
+        '-' => '_',
+        '=' => '+',
+        '[' => '{',
+        ']' => '}',
+        '\\' => '|',
+        ';' => ':',
+        '\'' => '"',
+        ',' => '<',
+        '.' => '>',
+        '/' => '?',
+        _ => return None,
+    })
+}
+
+/// The arrow key `up` or down, unmodified, as alternate scroll sends it.
+pub fn arrow(up: bool) -> KeyInput<'static> {
+    KeyInput {
+        action: KeyAction::Press,
+        key: if up {
+            GHOSTTY_KEY_ARROW_UP
+        } else {
+            GHOSTTY_KEY_ARROW_DOWN
+        },
+        mods: 0,
+        text: "",
+        unshifted: None,
+    }
+}
+
+pub fn mouse_button(button: gpui::MouseButton) -> MouseButton {
+    match button {
+        gpui::MouseButton::Left => MouseButton::Left,
+        gpui::MouseButton::Right => MouseButton::Right,
+        gpui::MouseButton::Middle => MouseButton::Middle,
+        gpui::MouseButton::Navigate(NavigationDirection::Back) => MouseButton::Four,
+        gpui::MouseButton::Navigate(NavigationDirection::Forward) => MouseButton::Five,
+    }
 }
