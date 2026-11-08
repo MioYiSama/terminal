@@ -6,6 +6,7 @@ use std::mem::size_of;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::os::windows::process::ExitStatusExt;
+use std::path::PathBuf;
 use std::process::ExitStatus;
 use std::sync::Arc;
 
@@ -189,11 +190,7 @@ fn wide(s: &OsStr) -> Vec<u16> {
 }
 
 fn command_line(cmd: &Command) -> Vec<u16> {
-    let program = cmd.program.clone().unwrap_or_else(|| {
-        env::var_os("ComSpec")
-            .filter(|shell| !shell.is_empty())
-            .unwrap_or_else(|| "cmd.exe".into())
-    });
+    let program = cmd.program.clone().unwrap_or_else(default_shell);
     let mut line = Vec::new();
     for (i, arg) in [&program].into_iter().chain(&cmd.args).enumerate() {
         if i > 0 {
@@ -203,6 +200,24 @@ fn command_line(cmd: &Command) -> Vec<u16> {
     }
     line.push(0);
     line
+}
+
+/// PowerShell 7 (`pwsh.exe`), then Windows PowerShell (`powershell.exe`), as
+/// found on `PATH`; otherwise `%ComSpec%` or `cmd.exe`.
+fn default_shell() -> OsString {
+    ["pwsh.exe", "powershell.exe"]
+        .into_iter()
+        .find_map(find_on_path)
+        .map(PathBuf::into_os_string)
+        .or_else(|| env::var_os("ComSpec").filter(|shell| !shell.is_empty()))
+        .unwrap_or_else(|| "cmd.exe".into())
+}
+
+fn find_on_path(name: &str) -> Option<PathBuf> {
+    env::split_paths(&env::var_os("PATH")?)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(name))
+        .find(|path| path.is_file())
 }
 
 /// Quote `arg` so `CommandLineToArgvW` and the MSVC runtime parse it back

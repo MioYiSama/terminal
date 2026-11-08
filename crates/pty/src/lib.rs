@@ -37,7 +37,8 @@ impl Command {
     }
 
     /// The user's default shell: `$SHELL`, the passwd entry, or `/bin/sh` on
-    /// Unix; `%ComSpec%` or `cmd.exe` on Windows.
+    /// Unix; on Windows the first of `pwsh.exe` and `powershell.exe` on
+    /// `PATH`, else `%ComSpec%` or `cmd.exe`.
     pub fn default_shell() -> Self {
         Self::with_program(None)
     }
