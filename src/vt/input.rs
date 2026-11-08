@@ -41,8 +41,9 @@ impl MouseAction {
     }
 }
 
-/// Mouse buttons as the terminal numbers them; `Four` and `Five` are also
-/// how the wheel is reported.
+/// Mouse buttons as the terminal numbers them. `Four` and `Five` are the
+/// wheel; `Eight` and `Nine` are the back and forward side buttons, as X11
+/// and xterm number them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MouseButton {
     Left,
@@ -50,6 +51,8 @@ pub enum MouseButton {
     Middle,
     Four,
     Five,
+    Eight,
+    Nine,
 }
 
 impl MouseButton {
@@ -60,6 +63,8 @@ impl MouseButton {
             Self::Middle => GHOSTTY_MOUSE_BUTTON_MIDDLE,
             Self::Four => GHOSTTY_MOUSE_BUTTON_FOUR,
             Self::Five => GHOSTTY_MOUSE_BUTTON_FIVE,
+            Self::Eight => GHOSTTY_MOUSE_BUTTON_EIGHT,
+            Self::Nine => GHOSTTY_MOUSE_BUTTON_NINE,
         }
     }
 }

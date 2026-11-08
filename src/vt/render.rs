@@ -4,6 +4,7 @@
 use core::ffi::c_void;
 use core::{mem, ptr};
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use ghostty_sys::*;
 
@@ -70,7 +71,15 @@ pub struct Line {
     pub cells: Vec<Cell>,
     /// Soft-wrapped: the text continues on the next line.
     pub wrapped: bool,
+    /// Unique to this content: a new version is taken each time the line
+    /// is read, which is only when it changed. Anything derived from a line
+    /// stays valid while its version does.
+    pub version: u64,
 }
+
+/// Source of `Line::version`, shared by all terminals so versions never
+/// repeat across them.
+static NEXT_LINE_VERSION: AtomicU64 = AtomicU64::new(1);
 
 /// One frame worth of terminal state, reused across frames to avoid
 /// reallocating.
@@ -281,9 +290,13 @@ impl RenderState {
         }
     }
 
-    /// Capture the terminal's visible state into `frame`. If libghostty
+    /// Capture the terminal's visible state into `frame`, re-reading only
+    /// the rows that changed since the last snapshot into it. If libghostty
     /// cannot update its render state (out of memory), `frame` keeps the
     /// last complete snapshot.
+    ///
+    /// `frame` must be the one this render state last filled: rows reported
+    /// clean are left as they are.
     pub fn snapshot(&mut self, terminal: &Terminal, frame: &mut Frame) {
         if unsafe { ghostty_render_state_update(self.raw, terminal.raw) } != GHOSTTY_SUCCESS {
             return;
@@ -302,18 +315,31 @@ impl RenderState {
             &mut self.rows,
         );
 
+        // libghostty redraws everything after a resize, but the frame may
+        // also be new.
+        let reread_all = frame.cols != cols || frame.lines.len() != rows as usize;
         frame.cols = cols;
         frame.background = colors.background.into();
         frame.foreground = colors.foreground.into();
         frame.lines.resize_with(rows as usize, Line::default);
-        let mut count = 0usize;
-        while count < rows as usize && unsafe { ghostty_render_state_row_iterator_next(self.rows) }
-        {
-            self.read_row(&colors, &mut frame.lines[count]);
-            count += 1;
+        if reread_all {
+            let mut count = 0usize;
+            while count < rows as usize
+                && unsafe { ghostty_render_state_row_iterator_next(self.rows) }
+            {
+                self.read_row(&colors, &mut frame.lines[count]);
+                count += 1;
+            }
+            frame.lines.truncate(count);
+        } else {
+            let mut y: u16 = 0;
+            while unsafe { ghostty_render_state_row_iterator_next_dirty(self.rows, &mut y) } {
+                if let Some(line) = frame.lines.get_mut(y as usize) {
+                    self.read_row(&colors, line);
+                }
+            }
         }
-        frame.lines.truncate(count);
-        frame.rows = count as u16;
+        frame.rows = frame.lines.len() as u16;
         frame.cursor = read_cursor(&cursor, &colors, &frame.lines);
         self.read_images(&mut frame.images);
 
@@ -322,6 +348,7 @@ impl RenderState {
 
     /// Read the row the row iterator is on.
     fn read_row(&mut self, colors: &GhosttyRenderStateColors, line: &mut Line) {
+        line.version = NEXT_LINE_VERSION.fetch_add(1, Ordering::Relaxed);
         line.text.clear();
         line.cells.clear();
         let mut raw_row: GhosttyRow = Default::default();

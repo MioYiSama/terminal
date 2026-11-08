@@ -3,12 +3,17 @@
 //! the child process.
 
 use std::io::{self, Read, Write};
+use std::mem;
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::Duration;
 
-use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
+use futures::SinkExt;
+use futures::channel::mpsc::{Receiver, Sender, channel};
+use futures::executor::block_on;
 use pty::{Command, Killer, Master, PtySize};
 
 use crate::shell::ShellKind;
@@ -18,6 +23,16 @@ use crate::shell::ShellKind;
 /// pty exits); ConPTY keeps its pipe open, and background jobs can keep a
 /// Unix pty open, so the wait is bounded.
 const EXIT_DRAIN_TIMEOUT: Duration = Duration::from_millis(200);
+/// Bytes read from the pty at once; each `Output` event holds at most this.
+const READ_SIZE: usize = 64 * 1024;
+/// `Output` events queued for the UI. When the UI falls behind, the reader
+/// waits, the pty fills up and the program blocks on its writes, so at most
+/// about this many reads are buffered.
+const OUTPUT_QUEUE: usize = 16;
+/// Input queued for a program that is not reading it. Beyond this, input is
+/// dropped: replies to queries the program keeps sending would otherwise
+/// pile up without bound.
+const MAX_PENDING_INPUT: usize = 16 * 1024 * 1024;
 
 pub enum PtyEvent {
     Output(Vec<u8>),
@@ -29,8 +44,20 @@ pub enum PtyEvent {
 pub struct Pty {
     master: Master,
     input: mpsc::Sender<Vec<u8>>,
+    /// Bytes sent to `input` and not yet written.
+    pending_input: Arc<AtomicUsize>,
     killer: Killer,
     shell: ShellKind,
+}
+
+/// What the reader thread is doing, so the waiter can tell a quiet pty from
+/// a reader held up by a busy UI.
+#[derive(Default)]
+struct ReaderProgress {
+    /// Blocked reading the pty.
+    waiting: AtomicBool,
+    /// Reads completed so far.
+    reads: AtomicUsize,
 }
 
 /// Kills the child unless disarmed, so a failed start leaves no process.
@@ -95,7 +122,7 @@ impl Pty {
         rows: u16,
         cell_width: u16,
         cell_height: u16,
-    ) -> Result<(Self, UnboundedReceiver<PtyEvent>), String> {
+    ) -> Result<(Self, Receiver<PtyEvent>), String> {
         let mut cmd = program.map_or_else(Command::default_shell, Command::new);
         for (name, _) in std::env::vars_os() {
             if name.to_str().is_some_and(describes_another_terminal) {
@@ -129,49 +156,64 @@ impl Pty {
 
         let mut reader = master.reader().map_err(|e| format!("pty reader: {e}"))?;
         let mut writer = master.writer().map_err(|e| format!("pty writer: {e}"))?;
-        let (events_tx, events_rx) = unbounded::<PtyEvent>();
+        let (mut events_tx, events_rx) = channel::<PtyEvent>(OUTPUT_QUEUE);
         let (reader_done_tx, reader_done_rx) = mpsc::channel::<()>();
 
         // Output, then `Exited` at EOF. Either this or the waiter reports
         // the exit; the consumer stops at the first.
-        let output_tx: UnboundedSender<PtyEvent> = events_tx.clone();
+        let mut output_tx: Sender<PtyEvent> = events_tx.clone();
+        let reader_progress = Arc::new(ReaderProgress::default());
+        let progress = reader_progress.clone();
         thread::Builder::new()
             .name("pty-reader".into())
             .spawn(move || {
-                let mut buf = vec![0u8; 64 * 1024];
+                let mut buf = vec![0u8; READ_SIZE];
                 loop {
-                    let n = match reader.read(&mut buf) {
+                    progress.waiting.store(true, Ordering::Relaxed);
+                    let read = reader.read(&mut buf);
+                    progress.waiting.store(false, Ordering::Relaxed);
+                    progress.reads.fetch_add(1, Ordering::Relaxed);
+                    let n = match read {
                         Ok(0) => break,
                         Ok(n) => n,
                         Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
                         Err(_) => break,
                     };
-                    if output_tx
-                        .unbounded_send(PtyEvent::Output(buf[..n].to_vec()))
-                        .is_err()
-                    {
+                    // Waits while the queue is full; fails once the UI is gone.
+                    if block_on(output_tx.send(PtyEvent::Output(buf[..n].to_vec()))).is_err() {
                         return;
                     }
                 }
                 let _ = reader_done_tx.send(());
-                let _ = output_tx.unbounded_send(PtyEvent::Exited);
+                let _ = block_on(output_tx.send(PtyEvent::Exited));
             })
             .map_err(|e| format!("spawn reader thread: {e}"))?;
 
         // ConPTY keeps the output pipe open after the shell exits, so exit is
         // detected by waiting on the child. Output the shell wrote before
         // exiting may still be in flight: let the reader drain it first, so
-        // `Exited` comes after it.
+        // `Exited` comes after it. Give up once the pty stays quiet, but not
+        // while the reader is only waiting for the UI to catch up.
         thread::Builder::new()
             .name("pty-waiter".into())
             .spawn(move || {
                 let _ = child.wait();
-                let _ = reader_done_rx.recv_timeout(EXIT_DRAIN_TIMEOUT);
-                let _ = events_tx.unbounded_send(PtyEvent::Exited);
+                let mut reads = reader_progress.reads.load(Ordering::Relaxed);
+                while let Err(RecvTimeoutError::Timeout) =
+                    reader_done_rx.recv_timeout(EXIT_DRAIN_TIMEOUT)
+                {
+                    let previous = mem::replace(&mut reads, reader_progress.reads.load(Ordering::Relaxed));
+                    if reader_progress.waiting.load(Ordering::Relaxed) && reads == previous {
+                        break;
+                    }
+                }
+                let _ = block_on(events_tx.send(PtyEvent::Exited));
             })
             .map_err(|e| format!("spawn waiter thread: {e}"))?;
 
         let (input_tx, input_rx) = mpsc::channel::<Vec<u8>>();
+        let pending_input = Arc::new(AtomicUsize::new(0));
+        let written = pending_input.clone();
         thread::Builder::new()
             .name("pty-writer".into())
             .spawn(move || {
@@ -179,6 +221,7 @@ impl Pty {
                     if writer.write_all(&bytes).and_then(|()| writer.flush()).is_err() {
                         break;
                     }
+                    written.fetch_sub(bytes.len(), Ordering::Relaxed);
                 }
             })
             .map_err(|e| format!("spawn writer thread: {e}"))?;
@@ -188,6 +231,7 @@ impl Pty {
             Self {
                 master,
                 input: input_tx,
+                pending_input,
                 killer,
                 shell,
             },
@@ -200,9 +244,21 @@ impl Pty {
         self.shell
     }
 
+    /// Queue `bytes` for the program without blocking. Dropped if the
+    /// program left too much input unread.
     pub fn write(&self, bytes: Vec<u8>) {
-        if !bytes.is_empty() {
-            let _ = self.input.send(bytes);
+        if bytes.is_empty() {
+            return;
+        }
+        let len = bytes.len();
+        let pending = self.pending_input.fetch_add(len, Ordering::Relaxed);
+        if pending + len > MAX_PENDING_INPUT {
+            self.pending_input.fetch_sub(len, Ordering::Relaxed);
+            eprintln!("dropped {len} bytes of input: the program is not reading");
+            return;
+        }
+        if self.input.send(bytes).is_err() {
+            self.pending_input.fetch_sub(len, Ordering::Relaxed);
         }
     }
 

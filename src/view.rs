@@ -1,15 +1,17 @@
 //! The terminal view: owns the libghostty terminal and the shell's pty, and
 //! routes keyboard, IME, mouse and clipboard input between them.
 
+use std::mem;
 use std::ops::Range;
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, EntityInputHandler, EventEmitter, FocusHandle,
     Focusable, Font, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Point, PromptLevel, Render, RenderImage, ScrollDelta,
+    MouseMoveEvent, MouseUpEvent, NavigationDirection, Pixels, Point, PromptLevel, Render, RenderImage, ScrollDelta,
     ScrollWheelEvent, SharedString, Subscription, Task, UTF16Selection, Window, actions, div, font,
     prelude::*, px, size,
 };
@@ -48,8 +50,16 @@ const MODE_FOCUS_EVENT: u16 = 1004;
 const MODE_ALTERNATE_SCROLL: u16 = 1007;
 /// Shortest wait between animation redraws (about 120 Hz).
 const MIN_FRAME_INTERVAL: Duration = Duration::from_millis(8);
+/// Most pty output applied in one update.
+const MAX_OUTPUT_BATCH: usize = 1024 * 1024;
 /// Mouse buttons the view listens to, for presses and releases alike.
-const MOUSE_BUTTONS: [MouseButton; 3] = [MouseButton::Left, MouseButton::Right, MouseButton::Middle];
+const MOUSE_BUTTONS: [MouseButton; 5] = [
+    MouseButton::Left,
+    MouseButton::Right,
+    MouseButton::Middle,
+    MouseButton::Navigate(NavigationDirection::Back),
+    MouseButton::Navigate(NavigationDirection::Forward),
+];
 
 pub enum TerminalEvent {
     TitleChanged,
@@ -80,6 +90,10 @@ pub struct TerminalView {
     base_font_size: Pixels,
     layout: Option<GridLayout>,
     composition: Composition,
+    /// The key press last left to the platform text input system, so the
+    /// text it types can be reported as that key when the program wants
+    /// every key as an escape code (Kitty keyboard protocol).
+    typed_key: Option<KeyDownEvent>,
     /// Fractional scroll lines carried between wheel events.
     scroll_remainder: f32,
     /// Button currently reported to the program via mouse tracking.
@@ -134,8 +148,12 @@ impl TerminalView {
                         PtyEvent::Output(bytes) => bytes,
                         PtyEvent::Exited => Vec::new(),
                     };
-                    // Coalesce whatever else is already queued into one update.
-                    while !exited && let Ok(event) = events.try_recv() {
+                    // Coalesce what else is already queued into one update, up
+                    // to a budget so a flood still lets frames through.
+                    while !exited
+                        && output.len() < MAX_OUTPUT_BATCH
+                        && let Ok(event) = events.try_recv()
+                    {
                         match event {
                             PtyEvent::Output(bytes) => output.extend_from_slice(&bytes),
                             PtyEvent::Exited => exited = true,
@@ -152,6 +170,7 @@ impl TerminalView {
                     if updated.is_err() || exited {
                         break;
                     }
+                    yield_now().await;
                 }
             }),
             None => Task::ready(()),
@@ -179,6 +198,7 @@ impl TerminalView {
             base_font_size: font_size,
             layout: None,
             composition: Composition::default(),
+            typed_key: None,
             scroll_remainder: 0.,
             reported_button: None,
             selecting: false,
@@ -408,6 +428,7 @@ impl TerminalView {
     // ---- keyboard ---------------------------------------------------------
 
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.typed_key = None;
         // While the IME is composing, it owns every key.
         if !self.composition.text.is_empty() {
             return;
@@ -427,6 +448,8 @@ impl TerminalView {
         }
         let mut text = String::new();
         let Some(mut input) = keys::encodable(&event.keystroke, &mut text) else {
+            // The text input system types it, or composes with it.
+            self.typed_key = Some(event.clone());
             return;
         };
         if event.is_held {
@@ -439,14 +462,24 @@ impl TerminalView {
     }
 
     fn key_up(&mut self, event: &KeyUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        self.typed_key = None;
         // Releases only matter to programs using the Kitty keyboard protocol
         // with event reporting.
         if !self.terminal.reports_key_releases() {
             return;
         }
         let mut text = String::new();
-        let Some(input) = keys::encodable(&event.keystroke, &mut text) else {
-            return;
+        let keystroke = &event.keystroke;
+        let input = match keys::encodable(keystroke, &mut text) {
+            Some(input) => input,
+            // Text keys are reported too if the program wants every key.
+            None if self.terminal.reports_all_keys()
+                && self.composition.text.is_empty()
+                && !keystroke.modifiers.platform =>
+            {
+                keys::text_key(keystroke, "")
+            }
+            None => return,
         };
         let input = KeyInput {
             action: KeyAction::Release,
@@ -792,10 +825,28 @@ impl EntityInputHandler for TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Committed text (typed characters or an IME result) goes to the
-        // program verbatim.
-        self.composition = Composition::default();
-        self.send_user_input(text.as_bytes().to_vec(), cx);
+        // Committed text goes to the program verbatim, unless it is what a
+        // single key typed and the program wants every key as an escape code.
+        // IME results are always text.
+        let typed_key = self.typed_key.take();
+        let composed = !mem::take(&mut self.composition).text.is_empty();
+        let bytes = match typed_key {
+            Some(event)
+                if !composed
+                    && event.keystroke.key_char.as_deref() == Some(text)
+                    && self.terminal.reports_all_keys() =>
+            {
+                let mut input = keys::text_key(&event.keystroke, text);
+                if event.is_held {
+                    input.action = KeyAction::Repeat;
+                }
+                let mut out = Vec::new();
+                self.key_encoder.encode(&self.terminal, &input, &mut out);
+                out
+            }
+            _ => text.as_bytes().to_vec(),
+        };
+        self.send_user_input(bytes, cx);
         cx.notify();
     }
 
@@ -807,6 +858,8 @@ impl EntityInputHandler for TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // The key started or continued a composition; it typed nothing itself.
+        self.typed_key = None;
         // Without a range the whole composition is replaced.
         let composition = &mut self.composition;
         let replaced = match range {
@@ -894,6 +947,22 @@ impl Render for TerminalView {
         }
         root.child(TerminalElement::new(cx.entity()))
     }
+}
+
+/// Go to the back of the executor's queue once, so pending frames and input
+/// run before the task continues.
+async fn yield_now() {
+    let mut yielded = false;
+    futures::future::poll_fn(|cx| {
+        if yielded {
+            Poll::Ready(())
+        } else {
+            yielded = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    })
+    .await
 }
 
 /// GPUI's element input handler with macOS press-and-hold disabled, so a held

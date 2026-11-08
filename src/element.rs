@@ -4,7 +4,10 @@
 //! emoji work), then glyphs are placed at their cells' x positions. Unicode
 //! box drawing and block elements instead fill device-aligned cell geometry,
 //! independent of font advances and the extra spacing between text rows.
+//! Laid-out rows are kept between frames and redone only for terminal lines
+//! that changed.
 
+use std::mem;
 use std::sync::Arc;
 
 use gpui::{
@@ -18,7 +21,7 @@ use crate::box_drawing;
 use crate::links::Link;
 use crate::grid::{GridLayout, PADDING, SCROLLBAR_WIDTH};
 use crate::view::{TerminalInputHandler, TerminalView};
-use crate::vt::{CursorShape, Frame, ImageLayer, ImagePlacement, Rgb, Underline};
+use crate::vt::{CursorShape, Frame, ImageLayer, ImagePlacement, Line, Rgb, Underline};
 
 pub struct TerminalElement {
     view: Entity<TerminalView>,
@@ -60,7 +63,7 @@ struct RowGlyphs {
 }
 
 /// Font metrics of the grid's rows, snapped to device pixels.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 struct Metrics {
     font_size: Pixels,
     ascent: Pixels,
@@ -104,13 +107,31 @@ impl Metrics {
     }
 }
 
-/// Cell contents: everything that changes with the terminal's text.
-struct Cells {
+/// One row's cells, laid out in window coordinates.
+struct Row {
+    key: RowKey,
+    glyphs: RowGlyphs,
     backgrounds: Vec<PaintQuad>,
-    rows: Vec<RowGlyphs>,
-    /// Row, column and scalar of cell-filling procedural symbols.
-    symbols: Vec<(usize, u16, char)>,
     decorations: Vec<PaintQuad>,
+    /// Column and scalar of cell-filling procedural symbols.
+    symbols: Vec<(u16, char)>,
+}
+
+/// Everything a row is laid out from, besides the font family.
+#[derive(Clone, Copy, PartialEq)]
+struct RowKey {
+    /// The terminal line's version, which changes with its contents.
+    version: u64,
+    origin: Point<Pixels>,
+    metrics: Metrics,
+}
+
+/// Rows laid out in the last frame, kept as element state so rows that
+/// did not change are not laid out again.
+#[derive(Default)]
+struct RowCache {
+    font: Option<gpui::Font>,
+    rows: Vec<Row>,
 }
 
 /// The cursor, or the IME composition shown in its place.
@@ -129,7 +150,8 @@ pub struct Prepared {
     layout: GridLayout,
     metrics: Metrics,
     background: Hsla,
-    cells: Cells,
+    font: gpui::Font,
+    rows: Vec<Row>,
     cursor: CursorDraw,
     /// Scrollbar thumb, and the track's hitbox for the arrow cursor.
     scrollbar: Option<(PaintQuad, Hitbox)>,
@@ -286,7 +308,7 @@ impl Element for TerminalElement {
     type PrepaintState = Prepared;
 
     fn id(&self) -> Option<ElementId> {
-        None
+        Some("terminal-grid".into())
     }
 
     fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
@@ -308,7 +330,7 @@ impl Element for TerminalElement {
 
     fn prepaint(
         &mut self,
-        _id: Option<&GlobalElementId>,
+        id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         _request_layout: &mut Self::RequestLayoutState,
@@ -332,15 +354,21 @@ impl Element for TerminalElement {
                 font.clone(),
                 font.clone().bold(),
                 font.clone().italic(),
-                font.bold().italic(),
+                font.clone().bold().italic(),
             ];
+            // Paint hands the rows back for the next frame.
+            let cache = window.with_element_state(id.expect("element has an id"), |cache, _| {
+                (cache.unwrap_or_default(), RowCache::default())
+            });
             let frame = view.snapshot(cx);
             let foreground = hsla(frame.foreground);
+            let rows = build_rows(frame, layout, &fonts, &metrics, cache, window);
             let mut prepared = Prepared {
                 layout,
                 metrics,
                 background: hsla(frame.background),
-                cells: build_cells(frame, layout, &fonts, &metrics, window),
+                font,
+                rows,
                 cursor: build_cursor(frame, layout, &fonts, &metrics, focused, marked_text, window),
                 scrollbar: None,
                 images: Vec::new(),
@@ -370,7 +398,7 @@ impl Element for TerminalElement {
 
     fn paint(
         &mut self,
-        _id: Option<&GlobalElementId>,
+        id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         _request_layout: &mut Self::RequestLayoutState,
@@ -403,16 +431,16 @@ impl Element for TerminalElement {
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
             window.paint_quad(fill(bounds, prepared.background));
             paint_images(&prepared.images, ImageLayer::BelowBackground, window);
-            for quad in prepared.cells.backgrounds.drain(..) {
-                window.paint_quad(quad);
+            for quad in prepared.rows.iter().flat_map(|row| &row.backgrounds) {
+                window.paint_quad(quad.clone());
             }
             paint_images(&prepared.images, ImageLayer::BelowText, window);
             if let Some(quad) = prepared.cursor.block.take() {
                 window.paint_quad(quad);
             }
             paint_text(prepared, window);
-            for quad in prepared.cells.decorations.drain(..) {
-                window.paint_quad(quad);
+            for quad in prepared.rows.iter().flat_map(|row| &row.decorations) {
+                window.paint_quad(quad.clone());
             }
             paint_images(&prepared.images, ImageLayer::AboveText, window);
             if let Some(quad) = prepared.cursor.overlay.take() {
@@ -439,6 +467,14 @@ impl Element for TerminalElement {
                 window.set_cursor_style(CursorStyle::Arrow, &hitbox);
             }
         });
+
+        let cache = RowCache {
+            font: Some(prepared.font.clone()),
+            rows: mem::take(&mut prepared.rows),
+        };
+        window.with_element_state(id.expect("element has an id"), |_: Option<RowCache>, _| {
+            ((), cache)
+        });
     }
 }
 
@@ -449,15 +485,16 @@ fn paint_text(prepared: &Prepared, window: &mut Window) {
     let font_size = prepared.metrics.font_size;
     let color_at = |row: usize, column: u16| match prepared.cursor.text {
         Some((r, c, color)) if r == row && c == column => color,
-        _ => prepared.cells.rows[row].colors[column as usize],
+        _ => prepared.rows[row].glyphs.colors[column as usize],
     };
-    for (row_index, row) in prepared.cells.rows.iter().enumerate() {
+    for (row_index, row) in prepared.rows.iter().enumerate() {
         let y = layout.cell_origin(0., row_index as f32).y + prepared.metrics.baseline;
+        let glyphs = &row.glyphs;
         let mut cluster_column = NO_COLUMN;
         let mut cluster_x = px(0.);
-        for run in row.line.runs.iter() {
+        for run in glyphs.line.runs.iter() {
             for glyph in &run.glyphs {
-                let column = row.byte_columns.get(glyph.index).copied().unwrap_or(NO_COLUMN);
+                let column = glyphs.byte_columns.get(glyph.index).copied().unwrap_or(NO_COLUMN);
                 if column == NO_COLUMN {
                     continue;
                 }
@@ -477,27 +514,58 @@ fn paint_text(prepared: &Prepared, window: &mut Window) {
                 }
             }
         }
-    }
 
-    for &(row, column, ch) in &prepared.cells.symbols {
-        let cell = Bounds::new(
-            layout.cell_origin(column as f32, row as f32),
-            size(layout.cell_width, layout.line_height),
-        );
-        box_drawing::paint(ch, cell, font_size, color_at(row, column), window);
+        for &(column, ch) in &row.symbols {
+            let cell = Bounds::new(
+                layout.cell_origin(column as f32, row_index as f32),
+                size(layout.cell_width, layout.line_height),
+            );
+            box_drawing::paint(ch, cell, font_size, color_at(row_index, column), window);
+        }
     }
 }
 
-/// Shape the rows' text and lay out cell backgrounds and decorations.
-fn build_cells(
+/// Lay out the frame's rows, reusing the cached rows whose line, position
+/// and font are unchanged.
+fn build_rows(
     frame: &Frame,
     layout: GridLayout,
     fonts: &[gpui::Font; 4],
     metrics: &Metrics,
+    cache: RowCache,
     window: &mut Window,
-) -> Cells {
-    let cw = layout.cell_width;
-    let lh = layout.line_height;
+) -> Vec<Row> {
+    let mut cached = if cache.font.as_ref() == Some(&fonts[0]) {
+        cache.rows
+    } else {
+        Vec::new()
+    };
+    cached.truncate(frame.lines.len());
+    let mut cached = cached.into_iter();
+    frame
+        .lines
+        .iter()
+        .enumerate()
+        .map(|(row_index, line)| {
+            let key = RowKey {
+                version: line.version,
+                origin: layout.cell_origin(0., row_index as f32),
+                metrics: *metrics,
+            };
+            match cached.next() {
+                Some(row) if row.key == key => row,
+                _ => build_row(line, key, fonts, window),
+            }
+        })
+        .collect()
+}
+
+/// Shape a row's text and lay out its cell backgrounds and decorations.
+fn build_row(line: &Line, key: RowKey, fonts: &[gpui::Font; 4], window: &mut Window) -> Row {
+    let metrics = &key.metrics;
+    let row_origin = key.origin;
+    let cw = metrics.cell_width;
+    let lh = metrics.line_height;
     let Metrics {
         thickness,
         underline_y,
@@ -508,114 +576,108 @@ fn build_cells(
 
     let mut backgrounds = Vec::new();
     let mut decorations = Vec::new();
-    let mut rows = Vec::with_capacity(frame.lines.len());
     let mut symbols = Vec::new();
 
-    for (row_index, line) in frame.lines.iter().enumerate() {
-        let row_origin = layout.cell_origin(0., row_index as f32);
-
-        // Cell backgrounds, merging horizontal runs of the same color.
-        let mut run: Option<(usize, usize, Rgb)> = None;
-        let flush = |run: Option<(usize, usize, Rgb)>, backgrounds: &mut Vec<PaintQuad>| {
-            if let Some((start, end, color)) = run {
-                backgrounds.push(fill(
-                    Bounds::new(
-                        row_origin + point(cw * start as f32, px(0.)),
-                        size(cw * (end - start) as f32, lh),
-                    ),
-                    hsla(color),
-                ));
+    // Cell backgrounds, merging horizontal runs of the same color.
+    let mut run: Option<(usize, usize, Rgb)> = None;
+    let flush = |run: Option<(usize, usize, Rgb)>, backgrounds: &mut Vec<PaintQuad>| {
+        if let Some((start, end, color)) = run {
+            backgrounds.push(fill(
+                Bounds::new(
+                    row_origin + point(cw * start as f32, px(0.)),
+                    size(cw * (end - start) as f32, lh),
+                ),
+                hsla(color),
+            ));
+        }
+    };
+    for (col, cell) in line.cells.iter().enumerate() {
+        match (run, cell.bg) {
+            (Some((start, end, color)), Some(bg)) if end == col && color == bg => {
+                run = Some((start, col + 1, color));
             }
+            (_, bg) => {
+                flush(run.take(), &mut backgrounds);
+                run = bg.map(|bg| (col, col + 1, bg));
+            }
+        }
+    }
+    flush(run, &mut backgrounds);
+
+    // Text and decorations.
+    let mut text = String::with_capacity(line.text.len() + 8);
+    let mut byte_columns: Vec<u16> = Vec::with_capacity(line.text.len() + 8);
+    let mut colors = Vec::with_capacity(line.cells.len());
+    let mut runs: Vec<TextRun> = Vec::new();
+    let mut next_col = 0usize;
+    for (col, cell) in line.cells.iter().enumerate() {
+        let mut fg = hsla(cell.fg);
+        if cell.faint {
+            fg.a *= 0.5;
+        }
+        colors.push(fg);
+
+        let width = if cell.wide { 2. } else { 1. };
+        let cell_origin = row_origin + point(cw * col as f32, px(0.));
+        let deco_color = cell.underline_color.map(hsla).unwrap_or(fg);
+        let mut line_at = |y: Pixels, color: Hsla| {
+            decorations.push(fill(
+                Bounds::new(cell_origin + point(px(0.), y), size(cw * width, thickness)),
+                color,
+            ));
         };
-        for (col, cell) in line.cells.iter().enumerate() {
-            match (run, cell.bg) {
-                (Some((start, end, color)), Some(bg)) if end == col && color == bg => {
-                    run = Some((start, col + 1, color));
-                }
-                (_, bg) => {
-                    flush(run.take(), &mut backgrounds);
-                    run = bg.map(|bg| (col, col + 1, bg));
-                }
+        match cell.underline {
+            // OSC 8 hyperlinks are underlined unless styled otherwise.
+            Underline::None if cell.hyperlink => line_at(underline_y, deco_color),
+            Underline::None => {}
+            Underline::Double => {
+                line_at(underline_y, deco_color);
+                line_at((underline_y - thickness * 2.).max(baseline), deco_color);
             }
+            // Curly, dotted and dashed underlines are drawn solid.
+            _ => line_at(underline_y, deco_color),
         }
-        flush(run, &mut backgrounds);
-
-        // Text and decorations.
-        let mut text = String::with_capacity(line.text.len() + 8);
-        let mut byte_columns: Vec<u16> = Vec::with_capacity(line.text.len() + 8);
-        let mut colors = Vec::with_capacity(line.cells.len());
-        let mut runs: Vec<TextRun> = Vec::new();
-        let mut next_col = 0usize;
-        for (col, cell) in line.cells.iter().enumerate() {
-            let mut fg = hsla(cell.fg);
-            if cell.faint {
-                fg.a *= 0.5;
-            }
-            colors.push(fg);
-
-            let width = if cell.wide { 2. } else { 1. };
-            let cell_origin = row_origin + point(cw * col as f32, px(0.));
-            let deco_color = cell.underline_color.map(hsla).unwrap_or(fg);
-            let mut line_at = |y: Pixels, color: Hsla| {
-                decorations.push(fill(
-                    Bounds::new(cell_origin + point(px(0.), y), size(cw * width, thickness)),
-                    color,
-                ));
-            };
-            match cell.underline {
-                // OSC 8 hyperlinks are underlined unless styled otherwise.
-                Underline::None if cell.hyperlink => line_at(underline_y, deco_color),
-                Underline::None => {}
-                Underline::Double => {
-                    line_at(underline_y, deco_color);
-                    line_at((underline_y - thickness * 2.).max(baseline), deco_color);
-                }
-                // Curly, dotted and dashed underlines are drawn solid.
-                _ => line_at(underline_y, deco_color),
-            }
-            if cell.strikethrough {
-                line_at(strike_y, fg);
-            }
-            if cell.overline {
-                line_at(px(0.), fg);
-            }
-
-            let cell_text = &line.text[cell.text.start as usize..cell.text.end as usize];
-            if cell.invisible || cell_text.is_empty() || cell_text == " " {
-                continue;
-            }
-            if let Some(ch) = box_drawing::character(cell_text) {
-                symbols.push((row_index, col as u16, ch));
-                continue;
-            }
-            // Separate non-adjacent cells so they cannot shape together.
-            if col != next_col && !text.is_empty() {
-                text.push(' ');
-                byte_columns.push(NO_COLUMN);
-                push_run(&mut runs, fonts, 0, 1);
-            }
-            text.push_str(cell_text);
-            byte_columns.extend(std::iter::repeat_n(col as u16, cell_text.len()));
-            let variant = cell.bold as usize | (cell.italic as usize) << 1;
-            push_run(&mut runs, fonts, variant, cell_text.len());
-            next_col = col + if cell.wide { 2 } else { 1 };
+        if cell.strikethrough {
+            line_at(strike_y, fg);
+        }
+        if cell.overline {
+            line_at(px(0.), fg);
         }
 
-        let line = window
-            .text_system()
-            .shape_line(text.into(), metrics.font_size, &runs, None);
-        rows.push(RowGlyphs {
+        let cell_text = &line.text[cell.text.start as usize..cell.text.end as usize];
+        if cell.invisible || cell_text.is_empty() || cell_text == " " {
+            continue;
+        }
+        if let Some(ch) = box_drawing::character(cell_text) {
+            symbols.push((col as u16, ch));
+            continue;
+        }
+        // Separate non-adjacent cells so they cannot shape together.
+        if col != next_col && !text.is_empty() {
+            text.push(' ');
+            byte_columns.push(NO_COLUMN);
+            push_run(&mut runs, fonts, 0, 1);
+        }
+        text.push_str(cell_text);
+        byte_columns.extend(std::iter::repeat_n(col as u16, cell_text.len()));
+        let variant = cell.bold as usize | (cell.italic as usize) << 1;
+        push_run(&mut runs, fonts, variant, cell_text.len());
+        next_col = col + if cell.wide { 2 } else { 1 };
+    }
+
+    let line = window
+        .text_system()
+        .shape_line(text.into(), metrics.font_size, &runs, None);
+    Row {
+        key,
+        glyphs: RowGlyphs {
             line,
             byte_columns,
             colors,
-        });
-    }
-
-    Cells {
+        },
         backgrounds,
-        rows,
-        symbols,
         decorations,
+        symbols,
     }
 }
 

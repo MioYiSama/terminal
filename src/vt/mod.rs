@@ -28,7 +28,7 @@ pub use input::{
     KeyAction, KeyEncoder, KeyInput, MouseAction, MouseButton, MouseEncoder, MouseInput,
     SurfaceSize, encode_focus,
 };
-pub use render::{CursorShape, Frame, ImageLayer, ImagePlacement, RenderState, Underline};
+pub use render::{CursorShape, Frame, ImageLayer, ImagePlacement, Line, RenderState, Underline};
 pub use selection::GesturePoint;
 
 /// Scrollback budget per terminal. Cells take 8 bytes, so this is about
@@ -354,10 +354,20 @@ impl Terminal {
     /// Whether the program asked for key release events (Kitty keyboard
     /// protocol with event reporting).
     pub fn reports_key_releases(&self) -> bool {
+        self.kitty_keyboard_flag(GHOSTTY_KITTY_KEY_REPORT_EVENTS)
+    }
+
+    /// Whether the program asked for every key, text keys included, as
+    /// escape codes (Kitty keyboard protocol).
+    pub fn reports_all_keys(&self) -> bool {
+        self.kitty_keyboard_flag(GHOSTTY_KITTY_KEY_REPORT_ALL)
+    }
+
+    fn kitty_keyboard_flag(&self, flag: u32) -> bool {
         let flags = self
             .get::<u8>(GHOSTTY_TERMINAL_DATA_KITTY_KEYBOARD_FLAGS)
             .unwrap_or(0);
-        flags & GHOSTTY_KITTY_KEY_REPORT_EVENTS as u8 != 0
+        flags & flag as u8 != 0
     }
 
     /// Scroll the viewport by `delta` rows (negative = up into history).

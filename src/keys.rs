@@ -153,14 +153,7 @@ pub fn encodable<'a>(keystroke: &'a Keystroke, owned_text: &'a mut String) -> Op
         return None;
     }
 
-    let unshifted = {
-        let mut chars = key.chars();
-        match (chars.next(), chars.next()) {
-            (Some(c), None) => Some(c),
-            _ if key == "space" => Some(' '),
-            _ => None,
-        }
-    };
+    let unshifted = unshifted(key);
 
     // The encoder wants the text before Ctrl/Alt transformations: the
     // shifted character for Shift, the plain key otherwise.
@@ -189,6 +182,29 @@ pub fn encodable<'a>(keystroke: &'a Keystroke, owned_text: &'a mut String) -> Op
         text,
         unshifted,
     })
+}
+
+/// A key that typed `text` through the platform text input system, for
+/// programs that want text keys as escape codes too.
+pub fn text_key<'a>(keystroke: &Keystroke, text: &'a str) -> KeyInput<'a> {
+    let key = keystroke.key.as_str();
+    KeyInput {
+        action: KeyAction::Press,
+        key: ghostty_key(key),
+        mods: ghostty_mods(&keystroke.modifiers),
+        text,
+        unshifted: unshifted(key),
+    }
+}
+
+/// The character GPUI's key name stands for, if it is one.
+fn unshifted(key: &str) -> Option<char> {
+    let mut chars = key.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) => Some(c),
+        _ if key == "space" => Some(' '),
+        _ => None,
+    }
 }
 
 /// The symbol Shift turns US-layout digit or punctuation key `c` into, as
@@ -241,7 +257,7 @@ pub fn mouse_button(button: gpui::MouseButton) -> MouseButton {
         gpui::MouseButton::Left => MouseButton::Left,
         gpui::MouseButton::Right => MouseButton::Right,
         gpui::MouseButton::Middle => MouseButton::Middle,
-        gpui::MouseButton::Navigate(NavigationDirection::Back) => MouseButton::Four,
-        gpui::MouseButton::Navigate(NavigationDirection::Forward) => MouseButton::Five,
+        gpui::MouseButton::Navigate(NavigationDirection::Back) => MouseButton::Eight,
+        gpui::MouseButton::Navigate(NavigationDirection::Forward) => MouseButton::Nine,
     }
 }
