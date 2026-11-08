@@ -197,12 +197,16 @@ fn save(settings: &Settings) {
         eprintln!("no config directory; settings not saved");
         return;
     };
+    // Write a sibling file and rename it over the old one, so a failed
+    // write never leaves a truncated settings file behind.
+    let temp = path.with_extension("json.tmp");
     let result = path
         .parent()
         .map_or(Ok(()), fs::create_dir_all)
         .and_then(|()| {
             let json = serde_json::to_string_pretty(settings).map_err(std::io::Error::other)?;
-            fs::write(&path, json)
+            fs::write(&temp, json)?;
+            fs::rename(&temp, &path)
         });
     if let Err(err) = result {
         eprintln!("failed to save {}: {err}", path.display());
