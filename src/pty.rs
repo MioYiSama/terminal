@@ -8,7 +8,7 @@ use std::sync::mpsc;
 use std::thread;
 
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
-use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use pty::{Command, Killer, Master, PtySize};
 
 pub enum PtyEvent {
     Output(Vec<u8>),
@@ -16,9 +16,9 @@ pub enum PtyEvent {
 }
 
 pub struct Pty {
-    master: Box<dyn MasterPty + Send>,
+    master: Master,
     input: mpsc::Sender<Vec<u8>>,
-    killer: Box<dyn ChildKiller + Send + Sync>,
+    killer: Killer,
 }
 
 fn pty_size(cols: u16, rows: u16, cell_width: u16, cell_height: u16) -> PtySize {
@@ -46,11 +46,7 @@ impl Pty {
         cell_width: u16,
         cell_height: u16,
     ) -> Result<(Self, UnboundedReceiver<PtyEvent>), String> {
-        let pair = native_pty_system()
-            .openpty(pty_size(cols, rows, cell_width, cell_height))
-            .map_err(|e| format!("openpty: {e}"))?;
-
-        let mut cmd = CommandBuilder::new_default_prog();
+        let mut cmd = Command::default_shell();
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
         cmd.env("TERM_PROGRAM", env!("CARGO_PKG_NAME"));
@@ -58,23 +54,12 @@ impl Pty {
             cmd.cwd(home);
         }
 
-        let mut child = pair
-            .slave
-            .spawn_command(cmd)
+        let (master, mut child) = pty::spawn(&cmd, pty_size(cols, rows, cell_width, cell_height))
             .map_err(|e| format!("spawn shell: {e}"))?;
-        // The child holds its own handle; keeping ours open would stop the
-        // reader from seeing EOF when the shell exits.
-        drop(pair.slave);
 
-        let killer = child.clone_killer();
-        let mut reader = pair
-            .master
-            .try_clone_reader()
-            .map_err(|e| format!("pty reader: {e}"))?;
-        let mut writer = pair
-            .master
-            .take_writer()
-            .map_err(|e| format!("pty writer: {e}"))?;
+        let killer = child.killer();
+        let mut reader = master.reader().map_err(|e| format!("pty reader: {e}"))?;
+        let mut writer = master.writer().map_err(|e| format!("pty writer: {e}"))?;
 
         let (events_tx, events_rx) = unbounded::<PtyEvent>();
 
@@ -124,7 +109,7 @@ impl Pty {
 
         Ok((
             Self {
-                master: pair.master,
+                master,
                 input: input_tx,
                 killer,
             },
