@@ -191,7 +191,7 @@ impl Render for FontPicker {
                     .collect()
             }),
         )
-        .track_scroll(self.scroll.clone())
+        .track_scroll(&self.scroll)
         .size_full();
 
         let results = div()

@@ -7,7 +7,7 @@ use gpui::{
     App, Bounds, ClipboardItem, ContentMask, Context, CursorStyle, Element, ElementId, ElementInputHandler,
     Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, Hsla,
     KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
-    Pixels, Point, ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle,
+    Pixels, Point, ShapedLine, SharedString, Style, TextAlign, TextRun, UTF16Selection, UnderlineStyle,
     Window, actions, div, fill, point, prelude::*, px, relative, size,
 };
 use unicode_segmentation::UnicodeSegmentation;
@@ -184,14 +184,14 @@ impl TextInput {
         self.replace_text_in_range(None, "", window, cx)
     }
 
-    fn blur(&mut self, _: &Blur, window: &mut Window, _: &mut Context<Self>) {
-        window.blur();
+    fn blur(&mut self, _: &Blur, window: &mut Window, cx: &mut Context<Self>) {
+        window.blur(cx);
     }
 
     fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         // Keep containers that blur on click from seeing this one.
         cx.stop_propagation();
-        self.focus_handle.focus(window);
+        self.focus_handle.focus(window, cx);
         self.is_selecting = true;
         let offset = self.index_for_mouse_position(event.position);
         if event.click_count >= 2 {
@@ -674,7 +674,7 @@ impl Element for TextElement {
                 window.paint_quad(selection)
             }
             let origin = point(bounds.left() - scroll_x, bounds.top());
-            let _ = line.paint(origin, window.line_height(), window, cx);
+            let _ = line.paint(origin, window.line_height(), TextAlign::Left, None, window, cx);
             if focus_handle.is_focused(window)
                 && let Some(cursor) = prepaint.cursor.take()
             {

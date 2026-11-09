@@ -13,7 +13,7 @@ use std::sync::Arc;
 use gpui::{
     App, BorderStyle, Bounds, ContentMask, Corners, CursorStyle, Element, RenderImage, ElementId, Entity, Focusable,
     GlobalElementId, Hitbox, HitboxBehavior, Hsla, InspectorElementId, IntoElement, LayoutId,
-    MouseExitEvent, MouseMoveEvent, PaintQuad, Pixels, Point, Rgba, ShapedLine, SharedString, Style, TextRun,
+    MouseExitEvent, MouseMoveEvent, PaintQuad, Pixels, Point, Rgba, ShapedLine, SharedString, Style, TextAlign, TextRun,
     UnderlineStyle, Window, DispatchPhase, fill, outline, point, px, relative, size,
 };
 
@@ -290,7 +290,14 @@ fn image_draws(
 fn paint_images(images: &[ImageDraw], layer: ImageLayer, window: &mut Window) {
     for draw in images.iter().filter(|draw| draw.layer == layer) {
         window.with_content_mask(Some(ContentMask { bounds: draw.clip }), |window| {
-            let _ = window.paint_image(draw.bounds, Corners::default(), draw.image.clone(), 0, false);
+            let _ = window.paint_image(
+                draw.bounds,
+                draw.bounds,
+                Corners::default(),
+                draw.image.clone(),
+                0,
+                false,
+            );
         });
     }
 }
@@ -449,7 +456,7 @@ impl Element for TerminalElement {
             let line_height = prepared.layout.line_height;
             if let Some((position, line, background)) = prepared.cursor.marked.take() {
                 window.paint_quad(background);
-                let _ = line.paint(position, line_height, window, cx);
+                let _ = line.paint(position, line_height, TextAlign::Left, None, window, cx);
             }
             if let Some(link) = prepared.link.take() {
                 for quad in link.underlines {
@@ -457,7 +464,7 @@ impl Element for TerminalElement {
                 }
                 let (position, line, background) = link.preview;
                 window.paint_quad(background);
-                let _ = line.paint(position, line_height, window, cx);
+                let _ = line.paint(position, line_height, TextAlign::Left, None, window, cx);
                 if let Some(hitbox) = &link.hitbox {
                     window.set_cursor_style(CursorStyle::PointingHand, hitbox);
                 }

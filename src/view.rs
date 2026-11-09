@@ -12,7 +12,7 @@ use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, EntityInputHandler, EventEmitter, FocusHandle,
     Focusable, Font, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, NavigationDirection, Pixels, Point, PromptLevel, Render, RenderImage, ScrollDelta,
-    ScrollWheelEvent, SharedString, Subscription, Task, UTF16Selection, Window, actions, div, font,
+    ScrollEvent, SharedString, Subscription, Task, UTF16Selection, Window, actions, div, font,
     prelude::*, px, size,
 };
 
@@ -183,7 +183,7 @@ impl TerminalView {
             cx.observe_global_in::<Settings>(window, Self::apply_settings),
             cx.observe_window_appearance(window, Self::apply_theme),
         ];
-        focus_handle.focus(window);
+        focus_handle.focus(window, cx);
 
         Self {
             terminal,
@@ -232,10 +232,6 @@ impl TerminalView {
 
     pub fn is_focused(&self, window: &Window) -> bool {
         self.focus_handle.is_focused(window)
-    }
-
-    pub fn focus(&self, window: &mut Window) {
-        self.focus_handle.focus(window);
     }
 
     /// Title set by the program, or empty.
@@ -330,7 +326,7 @@ impl TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.set_link_modifier(event.modifiers.secondary(), cx);
+        self.set_link_modifier(event.modifiers.secondary(cx), cx);
     }
 
     fn set_link_modifier(&mut self, held: bool, cx: &mut Context<Self>) {
@@ -644,13 +640,13 @@ impl TerminalView {
     }
 
     fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        self.focus_handle.focus(window);
+        self.focus_handle.focus(window, cx);
         if self.scrollbar_press(event, cx) {
             return;
         }
         // Cmd+click (Ctrl+click off macOS) opens a link, even over programs
         // that use the mouse.
-        if event.button == MouseButton::Left && event.modifiers.secondary() {
+        if event.button == MouseButton::Left && event.modifiers.secondary(cx) {
             self.pointer = Some(event.position);
             self.link_modifier = true;
             if let Some(link) = self.link_at(self.pointer_cell()) {
@@ -681,7 +677,7 @@ impl TerminalView {
     pub fn mouse_move(&mut self, event: &MouseMoveEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let Some(layout) = self.layout else { return };
         self.pointer = Some(event.position);
-        self.set_link_modifier(event.modifiers.secondary(), cx);
+        self.set_link_modifier(event.modifiers.secondary(cx), cx);
         if let Some(grab) = self.scrollbar_drag {
             let offset = layout.scrollbar_offset_at(self.scrollbar, event.position.y - grab);
             self.terminal.scroll_to_row(offset);
@@ -738,7 +734,7 @@ impl TerminalView {
         }
     }
 
-    fn scroll_wheel(&mut self, event: &ScrollWheelEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn scroll(&mut self, event: &ScrollEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let Some(layout) = self.layout else { return };
         let delta = match event.delta {
             ScrollDelta::Pixels(delta) => f32::from(delta.y) / f32::from(layout.line_height),
@@ -937,7 +933,7 @@ impl Render for TerminalView {
             .on_key_down(cx.listener(Self::key_down))
             .on_key_up(cx.listener(Self::key_up))
             .on_modifiers_changed(cx.listener(Self::modifiers_changed))
-            .on_scroll_wheel(cx.listener(Self::scroll_wheel));
+            .on_scroll(cx.listener(Self::scroll));
         // Releases outside the terminal end drags and reported presses too.
         for button in MOUSE_BUTTONS {
             root = root

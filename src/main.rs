@@ -25,7 +25,7 @@ mod vt;
 mod workspace;
 
 use gpui::{
-    App, Application, Bounds, KeyBinding, Menu, MenuItem, Pixels, Render, Size, TitlebarOptions,
+    App, Bounds, KeyBinding, Menu, MenuItem, Pixels, Render, Size, TitlebarOptions,
     Window, WindowBounds, WindowOptions, actions, prelude::*, px, size,
 };
 
@@ -138,27 +138,24 @@ fn open_or_activate<V: Render>(
 }
 
 fn set_menus(cx: &mut App) {
-    cx.set_menus(vec![Menu {
-        name: "Terminal".into(),
-        items: vec![
-            MenuItem::action(tr(cx, "menu-about"), About),
-            MenuItem::separator(),
-            MenuItem::action(tr(cx, "menu-settings"), OpenSettings),
-            MenuItem::separator(),
-            MenuItem::action(tr(cx, "menu-new-window"), NewWindow),
-            MenuItem::action(tr(cx, "menu-new-tab"), NewTab),
-            MenuItem::action(tr(cx, "menu-close-tab"), CloseTab),
-            MenuItem::separator(),
-            MenuItem::action(tr(cx, "menu-quit"), Quit),
-        ],
-    }]);
+    cx.set_menus(vec![Menu::new("Terminal").items([
+        MenuItem::action(tr(cx, "menu-about"), About),
+        MenuItem::separator(),
+        MenuItem::action(tr(cx, "menu-settings"), OpenSettings),
+        MenuItem::separator(),
+        MenuItem::action(tr(cx, "menu-new-window"), NewWindow),
+        MenuItem::action(tr(cx, "menu-new-tab"), NewTab),
+        MenuItem::action(tr(cx, "menu-close-tab"), CloseTab),
+        MenuItem::separator(),
+        MenuItem::action(tr(cx, "menu-quit"), Quit),
+    ])]);
 }
 
 fn main() {
     vt::install_png_decoder();
-    Application::new().run(|cx: &mut App| {
+    gpui_platform::application().run(|cx: &mut App| {
         // Quit when the last window closes (macOS keeps apps alive otherwise).
-        cx.on_window_closed(|cx| {
+        cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {
                 cx.quit();
             }

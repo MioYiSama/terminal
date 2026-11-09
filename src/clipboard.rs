@@ -18,14 +18,14 @@ pub enum Content {
 }
 
 pub fn read(cx: &App) -> Option<Content> {
-    #[cfg(any(target_os = "macos", windows))]
-    {
-        let files = native::file_paths();
-        if !files.is_empty() {
-            return Some(Content::Paths(files));
-        }
-    }
     let item = cx.read_from_clipboard()?;
+    // Copied files also come as text: their paths run together.
+    if let Some(paths) = item.entries().iter().find_map(|entry| match entry {
+        ClipboardEntry::ExternalPaths(paths) => Some(paths.paths().to_vec()),
+        _ => None,
+    }) {
+        return Some(Content::Paths(paths));
+    }
     if let Some(text) = item.text() {
         #[cfg(not(any(target_os = "macos", windows)))]
         if let Some(files) = file_uris(&text) {
@@ -35,13 +35,13 @@ pub fn read(cx: &App) -> Option<Content> {
     }
     item.into_entries().find_map(|entry| match entry {
         ClipboardEntry::Image(image) => Some(Content::Image(image)),
-        ClipboardEntry::String(_) => None,
+        ClipboardEntry::String(_) | ClipboardEntry::ExternalPaths(_) => None,
     })
 }
 
 /// Write the image to the per-user temporary directory, named after its
 /// content so pasting the same image again reuses the file, and return its
-/// path. TIFF (all that many macOS apps copy) and BMP become
+/// path. TIFF (all that many macOS apps copy), BMP, ICO and PNM become
 /// PNG: programs taking image paths accept PNG but not those.
 pub fn save_image(image: &Image) -> io::Result<PathBuf> {
     let (bytes, extension) = match image.format {
@@ -52,6 +52,8 @@ pub fn save_image(image: &Image) -> io::Result<PathBuf> {
         ImageFormat::Svg => (Cow::Borrowed(&image.bytes), "svg"),
         ImageFormat::Tiff => (Cow::Owned(to_png(&image.bytes, image::ImageFormat::Tiff)?), "png"),
         ImageFormat::Bmp => (Cow::Owned(to_png(&image.bytes, image::ImageFormat::Bmp)?), "png"),
+        ImageFormat::Ico => (Cow::Owned(to_png(&image.bytes, image::ImageFormat::Ico)?), "png"),
+        ImageFormat::Pnm => (Cow::Owned(to_png(&image.bytes, image::ImageFormat::Pnm)?), "png"),
     };
     let dir = dirs::runtime_dir()
         .unwrap_or_else(std::env::temp_dir)
@@ -109,76 +111,6 @@ fn percent_decode(text: &str) -> Option<Vec<u8>> {
         }
     }
     Some(out)
-}
-
-#[cfg(target_os = "macos")]
-mod native {
-    use std::path::PathBuf;
-
-    use objc2::ClassType;
-    use objc2_app_kit::NSPasteboard;
-    use objc2_foundation::{NSArray, NSURL};
-
-    /// Files copied in Finder. GPUI would read these as their names only.
-    pub fn file_paths() -> Vec<PathBuf> {
-        let pasteboard = NSPasteboard::generalPasteboard();
-        let classes = NSArray::from_slice(&[NSURL::class()]);
-        // SAFETY: NSURL implements NSPasteboardReading; no options.
-        let Some(objects) = (unsafe { pasteboard.readObjectsForClasses_options(&classes, None) })
-        else {
-            return Vec::new();
-        };
-        objects
-            .iter()
-            .filter_map(|object| {
-                let url = object.downcast::<NSURL>().ok()?;
-                // `path` also resolves Finder's file reference URLs.
-                url.isFileURL()
-                    .then(|| url.path())
-                    .flatten()
-                    .map(|path| PathBuf::from(path.to_string()))
-            })
-            .collect()
-    }
-}
-
-#[cfg(windows)]
-mod native {
-    use std::ffi::OsString;
-    use std::os::windows::ffi::OsStringExt;
-    use std::path::PathBuf;
-
-    use windows::Win32::System::DataExchange::{
-        CloseClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
-    };
-    use windows::Win32::System::Ole::CF_HDROP;
-    use windows::Win32::UI::Shell::{DragQueryFileW, HDROP};
-
-    /// Files copied in Explorer. GPUI reads these as one string with the
-    /// paths run together.
-    pub fn file_paths() -> Vec<PathBuf> {
-        let format = u32::from(CF_HDROP.0);
-        let mut paths = Vec::new();
-        unsafe {
-            if IsClipboardFormatAvailable(format).is_err() || OpenClipboard(None).is_err() {
-                return paths;
-            }
-            if let Ok(handle) = GetClipboardData(format) {
-                let hdrop = HDROP(handle.0);
-                let count = DragQueryFileW(hdrop, u32::MAX, None);
-                for index in 0..count {
-                    let len = DragQueryFileW(hdrop, index, None) as usize;
-                    let mut buf = vec![0u16; len + 1];
-                    let copied = DragQueryFileW(hdrop, index, Some(&mut buf)) as usize;
-                    if copied > 0 {
-                        paths.push(PathBuf::from(OsString::from_wide(&buf[..copied])));
-                    }
-                }
-            }
-            let _ = CloseClipboard();
-        }
-        paths
-    }
 }
 
 #[cfg(all(test, not(any(target_os = "macos", windows))))]

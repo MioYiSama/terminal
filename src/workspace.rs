@@ -2,7 +2,7 @@
 //! and Linux the tab bar starts with the application menu button.
 
 use gpui::{
-    Context, Entity, MouseButton, Pixels, SharedString, Subscription, Window, actions, div,
+    Context, Entity, Focusable, MouseButton, Pixels, SharedString, Subscription, Window, actions, div,
     prelude::*, px,
 };
 
@@ -79,7 +79,7 @@ impl Workspace {
 
     fn activate(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.active = ix;
-        self.tabs[ix].view.read(cx).focus(window);
+        self.tabs[ix].view.focus_handle(cx).focus(window, cx);
         self.update_window_title(window, cx);
         cx.notify();
     }

@@ -232,7 +232,7 @@ impl Render for SettingsView {
         div()
             .id("settings")
             // Clicking anywhere outside a text field takes focus away from it.
-            .on_mouse_down(MouseButton::Left, |_, window, _| window.blur())
+            .on_mouse_down(MouseButton::Left, |_, window, cx| window.blur(cx))
             .size_full()
             .overflow_y_scroll()
             .flex()

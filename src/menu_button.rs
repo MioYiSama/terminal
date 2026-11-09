@@ -79,7 +79,7 @@ impl MenuButton {
                                 binding
                                     .keystrokes()
                                     .iter()
-                                    .map(ToString::to_string)
+                                    .map(|keystroke| keystroke.display(cx.platform_info().os).to_string())
                                     .collect::<Vec<_>>()
                                     .join(" ")
                             });
