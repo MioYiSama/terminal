@@ -73,6 +73,56 @@ jobs:
           if [[ "${{ runner.os }}" == "Windows" ]]; then
             file="dist/$name.zip"
             7z a "$file" "./$dir/terminal.exe"
+          elif [[ "${{ runner.os }}" == "macOS" ]]; then
+            version="$(cargo metadata --no-deps --format-version 1 \
+              | jq -r '.packages[] | select(.name == "terminal") | .version')"
+            app="$RUNNER_TEMP/Terminal.app"
+            mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+            cp "$dir/terminal" "$app/Contents/MacOS/terminal"
+
+            # assets/terminal.png is 512px, so the iconset stops at 512x512.
+            iconset="$RUNNER_TEMP/terminal.iconset"
+            mkdir -p "$iconset"
+            for size in 16 32 128 256 512; do
+              sips -z "$size" "$size" assets/terminal.png \
+                --out "$iconset/icon_${size}x${size}.png" > /dev/null
+              if (( size * 2 <= 512 )); then
+                sips -z "$((size * 2))" "$((size * 2))" assets/terminal.png \
+                  --out "$iconset/icon_${size}x${size}@2x.png" > /dev/null
+              fi
+            done
+            iconutil -c icns "$iconset" -o "$app/Contents/Resources/terminal.icns"
+
+            cat > "$app/Contents/Info.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleDevelopmentRegion</key><string>en</string>
+            <key>CFBundleDisplayName</key><string>Terminal</string>
+            <key>CFBundleExecutable</key><string>terminal</string>
+            <key>CFBundleIconFile</key><string>terminal</string>
+            <key>CFBundleIdentifier</key><string>io.github.mioyisama.terminal</string>
+            <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+            <key>CFBundleName</key><string>Terminal</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>$version</string>
+            <key>CFBundleVersion</key><string>$version</string>
+            <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+            <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
+          </dict>
+          </plist>
+          EOF
+            plutil -lint "$app/Contents/Info.plist"
+
+            # Ad-hoc sign the bundle so the signature seals Info.plist and the icon.
+            codesign --force --sign - "$app"
+            codesign --verify --strict --verbose=2 "$app"
+
+            file="dist/$name.zip"
+            ditto -c -k --norsrc --noextattr --keepParent "$app" "$file"
           else
             file="dist/$name.tar.gz"
             tar -C "$dir" -czf "$file" terminal
@@ -100,7 +150,8 @@ jobs:
           path: dist
           pattern: terminal-*
           merge-multiple: true
-          # Keep the Windows .zip intact instead of extracting it.
+          # Keep the Windows and macOS .zip archives intact instead of
+          # extracting them.
           skip-decompress: true
 
       - name: Checksums
